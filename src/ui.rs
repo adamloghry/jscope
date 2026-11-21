@@ -1,7 +1,7 @@
 use crate::journal::Event;
 use crate::state::{
-    BinSeverity, Group, Grouping, SPARK_BINS, SpikeBin, SpikeSnapshot, State, UnitActivity,
-    WINDOW_MS,
+    BinSeverity, Group, Grouping, MessageOccurrence, SPARK_BINS, SpikeBin, SpikeSnapshot, State,
+    UnitActivity, WINDOW_MS,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -62,6 +62,10 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     {
         render_leader(frame, leader, state, entry, no_color);
     }
+    render_footer(frame, footer, state, status, no_color);
+    if let Some(occurrence) = state.spike().and_then(SpikeSnapshot::occurrence) {
+        return render_occurrence(frame, body, occurrence, state.detail_scroll(), no_color);
+    }
     if wide {
         let [tail, activity] = Layout::horizontal([
             Constraint::Min(1),
@@ -75,7 +79,6 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     } else {
         render_tail(frame, body, state, status, no_color);
     }
-    render_footer(frame, footer, state, status, no_color);
     expanded.map_or(0, |group| {
         render_details(
             frame,
@@ -633,13 +636,18 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
             Span::styled("Top messages", accent),
             Span::styled(" · prev→now/total", dim),
         ]));
-        for driver in &bin.drivers {
+        for (rank, driver) in bin.drivers.iter().enumerate() {
             let previous = driver
                 .previous_count
                 .map_or_else(|| "?".into(), |n| n.to_string());
             let share = format!("{previous}→{}/{} · ", driver.count, bin.count);
-            let message = truncate_display(&driver.message, width.saturating_sub(share.width()));
+            let key = format!("[{}] ", rank + 1);
+            let message = truncate_display(
+                &driver.message,
+                width.saturating_sub(key.width() + share.width()),
+            );
             lines.push(Line::from(vec![
+                Span::styled(key, dim),
                 Span::styled(share, accent),
                 Span::raw(message),
             ]));
@@ -811,9 +819,60 @@ fn render_details(
     fields.push(format!("Message  {}", entry.message));
 
     let block = section("Details · PgUp/PgDn scroll".into(), false, no_color);
+    render_scrollable_fields(frame, area, block, &fields, scroll)
+}
+
+fn render_occurrence(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    occurrence: MessageOccurrence<'_>,
+    scroll: usize,
+    no_color: bool,
+) -> usize {
+    let event = occurrence.event;
+    let ordinal = format!(
+        "Occurrence {}/{}",
+        occurrence.index + 1,
+        occurrence.retained
+    );
+    let omitted = occurrence.total - occurrence.retained as u64;
+    let count = if omitted == 0 {
+        ordinal
+    } else {
+        format!("{ordinal} retained · {omitted} repeat details omitted")
+    };
+    let fields = [
+        count,
+        format!(
+            "{} · {} · host {}",
+            event.unit,
+            severity(event.priority, no_color).0,
+            event.host.as_deref().unwrap_or("(unknown)")
+        ),
+        format!(
+            "Local {} · Journal realtime µs {}",
+            crate::local_time::format(event.realtime_us),
+            event
+                .realtime_us
+                .map_or_else(|| "(missing)".into(), |us| us.to_string())
+        ),
+        format!("Cursor {}", event.cursor.as_deref().unwrap_or("(missing)")),
+        event.message.clone(),
+    ];
+    let block = section("Message occurrences".into(), true, no_color);
+    render_scrollable_fields(frame, area, block, &fields, scroll)
+}
+
+fn render_scrollable_fields(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    block: Block<'_>,
+    fields: &[String],
+    scroll: usize,
+) -> usize {
     let content = block.inner(area);
     let mut lines = Vec::new();
-    for field in &fields {
+    for field in fields {
         wrap_line(field, usize::from(content.width), &mut lines);
     }
     let height = usize::from(content.height);
@@ -883,13 +942,23 @@ fn render_footer(
     let mut spans = Vec::new();
     let separator = if area.width >= 88 { "  " } else { " " };
     let mut keys = Vec::new();
-    if let Some(spike) = state.spike() {
+    if state.spike().and_then(SpikeSnapshot::occurrence).is_some() {
+        keys.extend([
+            ("←→", "occurrence"),
+            ("Enter", "jump"),
+            ("Esc", "back"),
+            ("PgUp/Dn", "scroll"),
+            ("g", "live"),
+            ("q", "quit"),
+        ]);
+    } else if let Some(spike) = state.spike() {
         if spike.peer.is_some() {
             keys.push(("↑↓", "service"));
         }
         keys.extend([
             ("←→", "interval"),
             ("Enter", "jump"),
+            ("1–3", "follow"),
             ("Esc", "back"),
             ("g", "live"),
             ("q", "quit"),

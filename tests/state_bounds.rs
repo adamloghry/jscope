@@ -142,6 +142,61 @@ fn repeat_boundaries_include_hidden_entries_hosts_units_levels_and_messages() {
 }
 
 #[test]
+fn frozen_repeat_receipts_obey_both_caps_and_keep_their_own_cursors() {
+    for (message, count) in [("retry".into(), 4_101), ("x".repeat(PAYLOAD_BYTES), 90)] {
+        let mut state = State::new(1, 1);
+        let template = event("worker", "demo", 6, &message, 0);
+        for id in 0..count {
+            let mut receipt = template.clone();
+            receipt.cursor = Some(id.to_string());
+            state.ingest(receipt, 10_000);
+        }
+        state.set_search("unmatched");
+        assert_eq!(state.activity_len(), 1);
+        assert_eq!(state.counters().activity_dropped, 0);
+        assert!(state.begin_spike());
+        state.follow_message(0).unwrap();
+        let first = state.spike().unwrap().occurrence().unwrap();
+        assert_eq!(first.event.cursor.as_deref(), Some("0"));
+        assert_eq!(first.total, count as u64);
+        assert!(first.retained < count);
+        if count == 4_101 {
+            assert_eq!(first.retained, 4_097); // First receipt plus the extra repeat cache.
+        } else {
+            assert!(first.retained <= 1 + 4 * 1024 * 1024 / PAYLOAD_BYTES);
+        }
+        let second_id = (1 + count - first.retained).to_string();
+        state.move_occurrence(1);
+        assert_eq!(
+            state
+                .spike()
+                .unwrap()
+                .occurrence()
+                .unwrap()
+                .event
+                .cursor
+                .as_deref(),
+            Some(second_id.as_str())
+        );
+
+        // Expire live activity and evict the row, then ingest an identical-looking copy.
+        state.ingest(event("other", "demo", 5, "new", 0), 80_000);
+        state.ingest(template, 80_001);
+        state.move_occurrence(isize::MAX);
+        let last = state.spike().unwrap().occurrence().unwrap();
+        assert_eq!(last.index + 1, last.retained);
+        assert_eq!(
+            last.event.cursor.as_deref(),
+            Some((count - 1).to_string().as_str())
+        );
+        assert!(state.jump_to_spike().unwrap_err().contains("evicted"));
+        assert!(state.spike().unwrap().occurrence().is_some());
+        state.leave_message();
+        assert!(state.spike().unwrap().occurrence().is_none());
+    }
+}
+
+#[test]
 fn nonadjacent_merges_charge_the_new_endpoint_to_the_history_byte_budget() {
     let mut state = State::default();
     let payload = "p".repeat(PAYLOAD_BYTES);

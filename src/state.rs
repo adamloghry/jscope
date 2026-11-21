@@ -13,6 +13,8 @@ const BURST_WINDOW_MS: u64 = 5_000;
 const BURST_DISTANCE: usize = 8;
 const MAX_ROW_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ACTIVITY_BYTES: usize = 12 * 1024 * 1024;
+const MAX_REPEAT_RECEIPTS: usize = 4_096;
+const MAX_REPEAT_BYTES: usize = 4 * 1024 * 1024;
 const SAMPLE_LIMIT: usize = 6;
 const MAX_MESSAGE_DRIVERS: usize = 3;
 const MAX_PINS: usize = 2;
@@ -107,10 +109,18 @@ impl Group {
 #[derive(Debug)]
 struct Intake {
     at: u64,
+    first_id: u64,
     /// History row of the first occurrence represented by this intake record.
     group_id: u64,
     event: Arc<Event>,
     count: u64,
+}
+
+/// Same-millisecond repeats share a rate record, while their journal cursors can differ.
+#[derive(Debug)]
+struct RepeatReceipt {
+    id: u64,
+    target: SpikeTarget,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -131,7 +141,7 @@ impl BinSeverity {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SpikeTarget {
     group_id: u64,
     event: Arc<Event>,
@@ -150,6 +160,13 @@ pub struct MessageCount {
     pub count: u64,
     /// Count of this exact text in the previous five seconds, if fully observed.
     pub previous_count: Option<u64>,
+    receipts: Vec<SpikeTarget>,
+}
+
+impl MessageCount {
+    pub fn occurrences(&self) -> impl ExactSizeIterator<Item = &Event> {
+        self.receipts.iter().map(|target| target.event.as_ref())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -195,6 +212,28 @@ pub struct SpikeSnapshot {
     pub peer: Option<SpikeLane>,
     /// Preserve each graph's screen position when switching the active service.
     pub peer_first: bool,
+    // Driver rank and position among its retained receipts, in arrival order.
+    following: Option<(usize, usize)>,
+}
+
+pub struct MessageOccurrence<'a> {
+    pub event: &'a Event,
+    pub index: usize,
+    pub retained: usize,
+    pub total: u64,
+}
+
+impl SpikeSnapshot {
+    pub fn occurrence(&self) -> Option<MessageOccurrence<'_>> {
+        let (rank, index) = self.following?;
+        let driver = &self.bins[self.selected].drivers[rank];
+        Some(MessageOccurrence {
+            event: &driver.receipts[index].event,
+            index,
+            retained: driver.receipts.len(),
+            total: driver.count,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -276,6 +315,8 @@ pub struct State {
     rows: VecDeque<Group>,
     grouping: Grouping,
     intake: VecDeque<Intake>,
+    repeats: VecDeque<RepeatReceipt>,
+    repeat_bytes: usize,
     row_bytes: usize,
     activity_bytes: usize,
     max_rows: usize,
@@ -313,6 +354,8 @@ impl State {
             rows: VecDeque::new(),
             grouping: Grouping::default(),
             intake: VecDeque::new(),
+            repeats: VecDeque::new(),
+            repeat_bytes: 0,
             row_bytes: 0,
             activity_bytes: 0,
             max_rows,
@@ -372,12 +415,21 @@ impl State {
             && same_key(&last.event, &event)
         {
             last.count += 1;
+            self.repeat_bytes += event_bytes(&event);
+            self.repeats.push_back(RepeatReceipt {
+                id: self.counters.received,
+                target: SpikeTarget { group_id, event },
+            });
+            while self.repeats.len() > MAX_REPEAT_RECEIPTS || self.repeat_bytes > MAX_REPEAT_BYTES {
+                self.pop_repeat();
+            }
             return;
         }
 
         self.activity_bytes += event_bytes(&event);
         self.intake.push_back(Intake {
             at: self.now,
+            first_id: self.counters.received,
             group_id,
             event,
             count: 1,
@@ -394,7 +446,23 @@ impl State {
     fn pop_intake(&mut self) -> Intake {
         let removed = self.intake.pop_front().expect("an intake entry to remove");
         self.activity_bytes -= event_bytes(&removed.event);
+        let last_id = removed.first_id + (removed.count - 1);
+        while self
+            .repeats
+            .front()
+            .is_some_and(|receipt| receipt.id <= last_id)
+        {
+            self.pop_repeat();
+        }
         removed
+    }
+
+    fn pop_repeat(&mut self) {
+        let receipt = self
+            .repeats
+            .pop_front()
+            .expect("a repeat receipt to remove");
+        self.repeat_bytes -= event_bytes(&receipt.target.event);
     }
 
     fn record_row(&mut self, event: Arc<Event>) -> u64 {
@@ -783,8 +851,38 @@ impl State {
                     message: message.to_owned(),
                     count,
                     previous_count: complete.then(|| previous.get(message).copied().unwrap_or(0)),
+                    receipts: Vec::new(),
                 })
                 .collect();
+        }
+        // Freeze only the three ranked messages. Each intake representative is
+        // exact; merge its retained repeat receipts before advancing to the next.
+        for (index, entry) in self
+            .window_entries()
+            .filter(|(_, entry)| entry.event.unit == unit)
+        {
+            let Some(driver) = bins[index]
+                .drivers
+                .iter_mut()
+                .find(|driver| driver.message == entry.event.message)
+            else {
+                continue;
+            };
+            driver.receipts.push(SpikeTarget {
+                group_id: entry.group_id,
+                event: Arc::clone(&entry.event),
+            });
+            if entry.count > 1 {
+                let start = self
+                    .repeats
+                    .partition_point(|receipt| receipt.id <= entry.first_id);
+                driver.receipts.extend(
+                    self.repeats
+                        .range(start..)
+                        .take_while(|receipt| receipt.id - entry.first_id < entry.count)
+                        .map(|receipt| receipt.target.clone()),
+                );
+            }
         }
         SpikeLane {
             unit: unit.to_owned(),
@@ -827,6 +925,7 @@ impl State {
             selected: index,
             peer,
             peer_first: false,
+            following: None,
         });
         true
     }
@@ -837,6 +936,7 @@ impl State {
 
     pub fn move_spike(&mut self, delta: isize) {
         if let Some(spike) = &mut self.spike {
+            spike.following = None;
             spike.selected = spike
                 .selected
                 .saturating_add_signed(delta)
@@ -848,6 +948,7 @@ impl State {
         if let Some(spike) = &mut self.spike
             && let Some(peer) = &mut spike.peer
         {
+            spike.following = None;
             std::mem::swap(&mut spike.unit, &mut peer.unit);
             std::mem::swap(&mut spike.bins, &mut peer.bins);
             spike.peer_first = !spike.peer_first;
@@ -858,15 +959,45 @@ impl State {
         self.spike = None;
     }
 
+    pub fn follow_message(&mut self, rank: usize) -> Result<(), &'static str> {
+        let spike = self
+            .spike
+            .as_mut()
+            .ok_or("Select a service interval first")?;
+        if rank >= spike.bins[spike.selected].drivers.len() {
+            return Err("No message at that rank in this interval");
+        }
+        spike.following = Some((rank, 0));
+        self.detail_scroll = 0;
+        Ok(())
+    }
+
+    pub fn move_occurrence(&mut self, delta: isize) {
+        if let Some(spike) = &mut self.spike
+            && let Some((rank, index)) = &mut spike.following
+        {
+            let last = spike.bins[spike.selected].drivers[*rank].receipts.len() - 1;
+            *index = index.saturating_add_signed(delta).min(last);
+            self.detail_scroll = 0;
+        }
+    }
+
+    pub fn leave_message(&mut self) {
+        if let Some(spike) = &mut self.spike {
+            spike.following = None;
+        }
+    }
+
     pub fn jump_to_spike(&mut self) -> Result<(), &'static str> {
         let spike = self
             .spike
             .as_ref()
             .ok_or("Select a service interval first")?;
-        let target = spike.bins[spike.selected]
-            .target
-            .as_ref()
-            .ok_or("This interval is empty")?;
+        let bin = &spike.bins[spike.selected];
+        let target = match spike.following {
+            Some((rank, index)) => &bin.drivers[rank].receipts[index],
+            None => bin.target.as_ref().ok_or("This interval is empty")?,
+        };
         if !target.retained(&self.rows) {
             return Err("The journal row for this spike was evicted");
         }
@@ -965,7 +1096,12 @@ impl State {
     }
 
     pub fn scroll_details(&mut self, delta: isize, limit: usize) {
-        if self.expanded_group().is_some() {
+        if self
+            .spike
+            .as_ref()
+            .is_some_and(|spike| spike.following.is_some())
+            || self.expanded_group().is_some()
+        {
             self.detail_scroll = self
                 .detail_scroll
                 .min(limit)

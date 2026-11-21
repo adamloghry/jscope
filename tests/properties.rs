@@ -681,6 +681,13 @@ fn check_interval(bin: &SpikeBin, events: &[&Event]) {
         .map(|driver| (driver.message.as_ref(), driver.count))
         .collect();
     assert_eq!(actual, ranked);
+    for driver in &bin.drivers {
+        let expected = events
+            .iter()
+            .copied()
+            .filter(|event| event.message == driver.message);
+        assert!(driver.occurrences().eq(expected));
+    }
 }
 
 #[hegel::test(test_cases = 150)]

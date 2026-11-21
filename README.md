@@ -37,6 +37,14 @@ Use **←/→** to select a bar. The preview shows the first error-or-higher ent
 
 **Top messages** ranks the three most frequent messages in the selected service and interval. A row such as `1→6/9 · Polling job queue` means that exact text occurred once in the previous five seconds and six times among the selected interval's nine arrivals. The lookup includes every message in the preceding interval, even one that fell outside its top three. A `?` before the arrow means the earlier interval predates startup or overlaps missing intake history. An observed interval with no matches shows `0`. Repeats count individually across priorities and hosts. Search, solo and mute leave these counts intact. Ties sort by message text. The breakdown stays frozen as you scrub.
 
+### Follow a ranked message
+
+In the spike inspector, **1**, **2** or **3** opens that ranked message from the active service and five-second interval. **←/→** steps through its retained occurrences in intake order. Each shows its own local time, journal timestamp in microseconds, host, priority and cursor, including occurrences folded into the same tail row. **PgUp/PgDn** scrolls long fields. **Esc** returns to the same graph and interval. **Enter** lands on the exact occurrence in the tail, temporarily revealing it if filtered out.
+
+In the muted-indexer demo, press **Tab → Enter → 1**. The six “Polling job queue” receipts start at `demo-01`. Step right three times to reach `demo-05`, then press Enter to see it inside the four-entry repeat group. Intake continues while you browse the frozen capture.
+
+Activity accounting shares a record for consecutive exact repeats received in the same millisecond. JournalScope keeps the first receipt of each retained record and caches up to 4,096 additional repeat receipts with a 4 MiB text budget. The browser shows how many repeat details were omitted when that cache filled. If a captured occurrence's tail row is later evicted, its metadata remains readable in the browser.
+
 ### Compare two services
 
 In the service list, press **p** on a service to pin it, then **Enter** on a different service to see both graphs together. Pin the second service too if you want to keep the pair, including when either goes quiet. Open either pinned service to compare them again. Press **p** on a pin to release it.
@@ -86,6 +94,8 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | Tab | Switch focus between tail and services |
 | ↑ / ↓ | Select a group or a service |
 | Enter | In the tail, expand or close details. In services, inspect the unit's graph. In the inspector, jump to the selected interval |
+| 1 / 2 / 3 in the inspector | Follow that ranked message in the selected service and interval |
+| ← / → while following a message | Move to the previous or next exact occurrence. Enter jumps to the tail, Esc goes back to the graph |
 | p | Pin or unpin the selected service for comparison (up to two) |
 | ← / → | Select an older or newer five-second interval in the inspector |
 | ↑ / ↓ in a paired inspector | Switch the active service at the same interval |

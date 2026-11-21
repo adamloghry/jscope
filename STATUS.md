@@ -36,8 +36,8 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-30 | Test owner, tests/properties.rs and tests/replay.rs | verified | JS-28 interface | Five Hegel properties and eleven replay tests passed |
 | JS-31 | Integrator, controls, packaged terminal tests, docs and check-in | verified | JS-28–30 | None on x86_64-linux |
 | JS-32 | Comparison owner and integrator, interval message counts | verified | JS-28 | Complete. 70 Rust tests and packaged terminal checks passed on x86_64-linux |
-| JS-33 | Occurrence owner and integrator, exact message navigation | active | JS-28, JS-32 integration | Freeze bounded occurrence identities and test cursor-by-cursor navigation |
-| JS-34 | Recovery owner and integrator, service rate recovery | active | JS-20, JS-33 integration | Track a return to the pre-burst rate and verify the marker and duration |
+| JS-33 | Occurrence owner and integrator, exact message navigation | verified | JS-28, JS-32 integration | Complete. The combined flake and packaged cursor walkthrough passed |
+| JS-34 | Recovery owner and integrator, service rate recovery | active | JS-20, JS-33 integration | Isolated recovery tests passed. Integrate and run the combined timed replay and VM |
 
 ## Shared contract
 
@@ -65,7 +65,7 @@ Replay has no control records or timing directives. Tests advance the state cloc
 
 ## Verification evidence
 
-- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 68 Rust tests including five Hegel properties, eleven replay tests, four retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
+- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 71 Rust tests including five Hegel properties, thirteen replay tests, five retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
 - `nix build .#vm-test --no-link -L` passed on x86_64-linux in a disposable NixOS VM. It verified real journalctl follow, matching unit and priority filters, exclusion of archived records from a prior guest boot, zero and nonzero backlogs, SIGTERM shutdown, child reaping, and restored terminal settings. All logs used for the test were synthetic guest records.
 - The exact README replay command passed in an 80×24 pseudo-terminal. File and piped replay also passed direct PTY smoke tests, including details, unmute, clean quit, and terminal restoration with the pipe still open. `nix run . -- --help` verified the default app entry point.
 - `nix flake check --all-systems --no-build` evaluated package, app, dev shell, standard checks, and VM check for x86_64-linux and aarch64-linux. The environment exposes x86_64 builders only, so aarch64-linux build and runtime tests remain open.
@@ -73,6 +73,7 @@ Replay has no control records or timing directives. Tests advance the state cloc
 ## Spike investigation verification
 
 - The message comparison passed the full flake checks in isolation and after integration. The 150-case receipt model checked both lanes across all twelve intervals. Deterministic tests checked a previous fourth-ranked message, observed zero, incomplete startup, capacity loss, and an oldest-bin comparison surviving expiry.
+- In a timed 80-column replay the muted service produced `1→6/7 · retry` and `0→1/7 · queue blocked`. The packaged occurrence test stepped through all six demo poll cursors, switched ranks, and landed on `demo-02` inside the repeat group ending at `demo-05`. Model and capacity tests checked order, cache gaps, preserved counts, and exact identity after tail eviction.
 
 - At both 80×24 and 104×24, the packaged README replay showed the proxy warning at 08:53:20.600 and the indexer warning at 08:53:21.600 under `TZ=UTC0`. Scrubbing kept both graphs aligned. Switching to the muted indexer showed “Polling job queue” at 6/9, the warning at 2/9, and the leased item at 1/9. Enter landed on the warning with cursor `demo-09`. The walkthrough passed with one pin and the PTY regression exercised both pins.
 - The piped terminal test navigated between two filtered warnings/errors from different services, five seconds apart in receipt time and identical in journal time. It checked exact cursors, both navigation boundaries, continued intake, and restoration of the original search on return to live.

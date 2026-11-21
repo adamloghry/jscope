@@ -303,6 +303,27 @@ def test_tail_spike_hops(binary):
         wait_for("Live", "25% shown", "heartbeat", absent=("outside filters", "Spike cursor"))
 
 
+def test_follow_ranked_message(binary, fixture):
+    command = [binary, "--input", fixture, "--mute-unit", "indexer.service", "--no-color"]
+    with terminal(command, columns=80, lines=24, env={"TZ": "UTC0"}) as (_, keys, wait_for):
+        wait_for("11/min", "9/2/7")
+        keys(b"\t\r1")
+        wait_for("Message occurrences", "Occurrence 1/6", "08:53:20.000", "Cursor demo-01")
+        for ordinal, cursor in enumerate(("02", "03", "05", "07", "11"), 2):
+            keys(b"\x1b[C")
+            wait_for(f"Occurrence {ordinal}/6", f"Cursor demo-{cursor}", "Polling job queue")
+        keys(b"\x1b")
+        wait_for("Top messages", "1–3 follow", "[1] ?→6/9 · Polling job queue")
+        keys(b"2")
+        wait_for("Occurrence 1/2", "Cursor demo-09")
+        keys(b"\x1b[C")
+        wait_for("Occurrence 2/2", "Cursor demo-10")
+        keys(b"3")
+        wait_for("Occurrence 1/1", "Cursor demo-06")
+        keys(b"1\x1b[C\r\r")
+        wait_for("Paused", "outside filters", "Spike cursor demo-02", "Latest cursor demo-05")
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
@@ -310,3 +331,4 @@ if __name__ == "__main__":
     test_jump_to_spike(sys.argv[1])
     test_compare_spike_drivers(sys.argv[1], sys.argv[2])
     test_tail_spike_hops(sys.argv[1])
+    test_follow_ranked_message(sys.argv[1], sys.argv[2])

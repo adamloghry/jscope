@@ -248,14 +248,26 @@ impl Controls {
     }
 
     fn spike_key(&mut self, code: KeyCode, state: &mut State) {
+        let following = state.spike().and_then(|spike| spike.occurrence()).is_some();
         match code {
+            KeyCode::Char(rank @ '1'..='3') => {
+                self.notice = state
+                    .follow_message(rank as usize - '1' as usize)
+                    .err()
+                    .map(String::from);
+            }
+            KeyCode::Left if following => state.move_occurrence(-1),
+            KeyCode::Right if following => state.move_occurrence(1),
+            KeyCode::PageUp if following => state.scroll_details(-6, self.detail_scroll_limit),
+            KeyCode::PageDown if following => state.scroll_details(6, self.detail_scroll_limit),
             KeyCode::Left => state.move_spike(-1),
             KeyCode::Right => state.move_spike(1),
-            KeyCode::Up | KeyCode::Down => state.switch_spike_unit(),
+            KeyCode::Up | KeyCode::Down if !following => state.switch_spike_unit(),
             KeyCode::Enter => match state.jump_to_spike() {
                 Ok(()) => self.service_focus = false,
                 Err(reason) => self.notice = Some(reason.to_string()),
             },
+            KeyCode::Esc if following => state.leave_message(),
             KeyCode::Esc => state.cancel_spike(),
             KeyCode::Tab => {
                 state.cancel_spike();
