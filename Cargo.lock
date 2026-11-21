@@ -391,6 +391,7 @@ dependencies = [
  "hegeltest",
  "ratatui",
  "rustix",
+ "serde",
  "serde_json",
  "signal-hook",
  "time",

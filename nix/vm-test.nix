@@ -1,4 +1,4 @@
-{ pkgs, binary }:
+{ pkgs, binary, module }:
 
 pkgs.testers.runNixOSTest {
   name = "jscope-systemd-follow";
@@ -6,12 +6,18 @@ pkgs.testers.runNixOSTest {
   qemu.forceAccel = false;
 
   nodes.machine = { config, lib, pkgs, ... }: {
-    imports = [ ./generation-markers.nix ];
-    programs.jscope.generationMarkers.enable = true;
+    imports = [ module ];
+    programs.jscope = {
+      generationMarkers.enable = true;
+      enable = true;
+      backlog = 8;
+      pinnedUnits = [ "jscope-target.service" ];
+      mutedUnits = [ "jscope-foreign.service" ];
+    };
     specialisation.marker-test.configuration.environment.etc."jscope-specialisation".text = "test";
     # A parent closure already contains every specialisation. Keep hello exclusively
     # in the parent's own profile so switching to the child really removes it.
-    environment.systemPackages = [ binary pkgs.python3 ]
+    environment.systemPackages = [ pkgs.python3 ]
       ++ lib.optional (config.specialisation != { }) pkgs.hello;
     nix.enable = true;
     services.journald.storage = "persistent";
@@ -52,14 +58,14 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"echo {phase} > /run/jscope-phase")
         machine.succeed("systemctl start jscope-target.service; journalctl --sync")
 
-    def exercise_follow(phase: str, backlog: int) -> None:
+    def exercise_follow(phase: str, backlog: int, host_default: bool = False) -> None:
         probe = f"jscope-{phase.lower()}"
         work = f"/tmp/{probe}"
         machine.succeed(f"install -d -o observer -g users {work}")
         machine.succeed(
             f"systemd-run --unit={probe} -p User=observer -p WorkingDirectory={work} "
             "${pkgs.python3}/bin/python ${./vm-probe.py} ${binary}/bin/jscope "
-            f"{phase} {backlog}"
+            f"{phase} {backlog}" + (" default" if host_default else "")
         )
 
         def await_probe(marker: str) -> None:
@@ -103,6 +109,9 @@ pkgs.testers.runNixOSTest {
         "${../tests/terminal.py} ${binary}/bin/jscope "
         f"{base} {special} ${pkgs.hello.version}"
     )
+    machine.succeed("command -v jscope && jscope --version")
+    defaults = json.loads(machine.succeed("cat /etc/jscope/defaults.json"))
+    assert defaults == {"backlog": 8, "pinnedUnits": ["jscope-target.service"], "mutedUnits": ["jscope-foreign.service"]}
     send_target("PRIOR_BOOT")
     machine.shutdown()
 
@@ -117,5 +126,6 @@ pkgs.testers.runNixOSTest {
     send_target("PREEXISTING")
     exercise_follow("BACKLOG_FOLLOW", 10)
     exercise_follow("ZERO_FOLLOW", 0)
+    exercise_follow("HOST_DEFAULT", 8, host_default=True)
   '';
 }

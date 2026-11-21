@@ -24,7 +24,7 @@ def wait_for(predicate, drain, timeout=20):
 
 
 def main():
-    binary, phase, backlog = sys.argv[1:]
+    binary, phase, backlog, *options = sys.argv[1:]
     master, slave = pty.openpty()
     termios.tcsetwinsize(slave, (30, 150))
     initial_terminal = termios.tcgetattr(slave)
@@ -49,7 +49,7 @@ def main():
             "--unit=jscope-target.service",
             "--boot=0",
             "--priority=err",
-            f"--backlog={backlog}",
+            *([] if options == ["default"] else [f"--backlog={backlog}"]),
             "--no-color",
         ],
         stdin=slave,

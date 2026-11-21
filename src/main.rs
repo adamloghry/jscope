@@ -1,5 +1,7 @@
 mod closure_diff;
 
+mod defaults;
+
 use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -44,8 +46,8 @@ struct Args {
     input: Option<PathBuf>,
 
     /// Maximum number of matching journal entries to load before following.
-    #[arg(long, default_value_t = DEFAULT_BACKLOG, conflicts_with = "input")]
-    backlog: u32,
+    #[arg(long, conflicts_with = "input")]
+    backlog: Option<u32>,
 
     /// Match a journalctl unit name or pattern. Repeat to add more units.
     #[arg(short, long, value_name = "UNIT", conflicts_with = "input")]
@@ -75,6 +77,14 @@ struct Args {
     #[arg(long, value_name = "UNIT", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     mute_unit: Vec<String>,
 
+    /// Pin an exact service at startup (at most two). Repeat to set both.
+    #[arg(long, value_name = "UNIT", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pin_unit: Vec<String>,
+
+    /// Ignore /etc/jscope/defaults.json for this session.
+    #[arg(long)]
+    no_defaults: bool,
+
     /// Group only consecutive exact repeats. By default, nearby routine repeats can span other units.
     #[arg(long)]
     adjacent_only: bool,
@@ -85,12 +95,27 @@ struct Args {
 }
 
 impl Args {
-    fn initial_state(&self) -> io::Result<State> {
+    fn initial_state(&self, defaults: &defaults::Defaults) -> io::Result<State> {
         let mut state = State::default();
         if self.adjacent_only {
             state.set_grouping(Grouping::Adjacent);
         }
-        for unit in &self.mute_unit {
+        let pins = if self.pin_unit.is_empty() {
+            &defaults.pinned_units
+        } else {
+            &self.pin_unit
+        };
+        let mutes = if self.mute_unit.is_empty() {
+            &defaults.muted_units
+        } else {
+            &self.mute_unit
+        };
+        for unit in pins {
+            state
+                .pin_unit(&sanitize(unit))
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        }
+        for unit in mutes {
             state
                 .set_unit_muted(&sanitize(unit), true)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -393,7 +418,12 @@ fn run(args: Args) -> io::Result<ExitCode> {
         signal_hook::flag::register(signal, Arc::clone(&stop))?;
     }
 
-    let mut state = args.initial_state()?;
+    let defaults = if args.no_defaults {
+        defaults::Defaults::default()
+    } else {
+        defaults::Defaults::load(Path::new("/etc/jscope/defaults.json"))?
+    };
+    let mut state = args.initial_state(&defaults)?;
 
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -405,7 +435,7 @@ fn run(args: Args) -> io::Result<ExitCode> {
             )
         })?,
         None => Source::live(&JournalFilters {
-            backlog: args.backlog,
+            backlog: args.backlog.or(defaults.backlog).unwrap_or(DEFAULT_BACKLOG),
             units: args.unit,
             user_units: args.user_unit,
             boot: args.boot,
@@ -527,7 +557,7 @@ mod tests {
     fn live_and_replay_start_with_every_received_priority_visible() {
         for argv in [&["jscope"][..], &["jscope", "--input", "-"]] {
             let args = Args::try_parse_from(argv).unwrap();
-            let mut state = args.initial_state().unwrap();
+            let mut state = args.initial_state(&Default::default()).unwrap();
             let demo = include_bytes!("../fixtures/demo.jsonl");
             let mut decoder = Decoder::new(demo.as_slice(), MAX_LINE_BYTES);
             while let Some(Frame::Event(event)) = decoder.next_frame().unwrap() {
@@ -554,10 +584,39 @@ mod tests {
             r"queue@disk\x2d1.service",
         ])
         .unwrap();
-        let state = args.initial_state().unwrap();
+        let state = args.initial_state(&Default::default()).unwrap();
         assert!(!state.is_muted());
         assert!(state.is_unit_muted("worker.service"));
         assert!(state.is_unit_muted(r"queue@disk\\x2d1.service"));
+    }
+
+    #[test]
+    fn host_defaults_and_cli_overrides_are_independent() {
+        let defaults = super::defaults::Defaults {
+            backlog: Some(37),
+            pinned_units: vec!["db.service".into()],
+            muted_units: vec!["worker.service".into()],
+        };
+        let replay = Args::try_parse_from(["jscope", "--input", "-"]).unwrap();
+        let state = replay.initial_state(&defaults).unwrap();
+        assert!(state.is_pinned("db.service") && state.is_unit_muted("worker.service"));
+        let args = Args::try_parse_from(["jscope", "--pin-unit", "api.service", "--backlog", "0"])
+            .unwrap();
+        let state = args.initial_state(&defaults).unwrap();
+        assert_eq!(args.backlog.or(defaults.backlog), Some(0));
+        assert!(state.is_pinned("api.service") && !state.is_pinned("db.service"));
+        assert!(state.is_unit_muted("worker.service"));
+        let too_many = Args::try_parse_from([
+            "jscope",
+            "--pin-unit",
+            "a",
+            "--pin-unit",
+            "b",
+            "--pin-unit",
+            "c",
+        ])
+        .unwrap();
+        assert!(too_many.initial_state(&defaults).is_err());
     }
 
     #[test]
@@ -578,13 +637,13 @@ mod tests {
             "warning..debug",
         ])
         .unwrap();
-        assert_eq!(live.backlog, 0);
+        assert_eq!(live.backlog, Some(0));
         assert_eq!(live.unit, ["foo.service", "bar.*"]);
         assert_eq!(live.user_unit, ["mail.service"]);
         assert_eq!(live.boot.as_deref(), Some("-1"));
         assert_eq!(live.priority.as_deref(), Some("warning..debug"));
         assert_eq!(
-            live.initial_state().unwrap().grouping(),
+            live.initial_state(&Default::default()).unwrap().grouping(),
             super::Grouping::Burst
         );
 
@@ -593,7 +652,10 @@ mod tests {
         assert_eq!(current.boot.as_deref(), Some("0"));
         assert!(current.no_color);
         assert_eq!(
-            current.initial_state().unwrap().grouping(),
+            current
+                .initial_state(&Default::default())
+                .unwrap()
+                .grouping(),
             super::Grouping::Adjacent
         );
 

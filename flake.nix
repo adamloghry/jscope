@@ -4,7 +4,7 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/7dcdd87373d72e7a2173e4db02e20d3d7f495cfd";
 
   outputs =
-    { nixpkgs, ... }:
+    { self, nixpkgs, ... }:
     let
       inherit (nixpkgs) lib;
       forLinux = lib.genAttrs [
@@ -61,7 +61,7 @@
         {
           packages = {
             default = binary;
-            vm-test = import ./nix/vm-test.nix { inherit pkgs binary; };
+            vm-test = import ./nix/vm-test.nix { inherit pkgs binary; module = self.nixosModules.default; };
           };
           apps.default = {
             type = "app";
@@ -98,8 +98,16 @@
         }
       );
     in
-    { nixosModules.default = import ./nix/generation-markers.nix; }
-    // lib.genAttrs [ "packages" "apps" "checks" "devShells" ] (
+    lib.genAttrs [ "packages" "apps" "checks" "devShells" ] (
       output: forLinux (system: perSystem.${system}.${output})
-    );
+    ) // {
+      nixosModules.default = { pkgs, ... }: {
+        imports = [
+          ./nix/generation-markers.nix
+          (import ./nix/program.nix {
+            defaultPackage = perSystem.${pkgs.stdenv.hostPlatform.system}.packages.default;
+          })
+        ];
+      };
+    };
 }

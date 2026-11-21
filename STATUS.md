@@ -47,7 +47,7 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-36 | Pattern owner | verified | Ranked messages | Integrated flake check passed, including pattern originals and the generated model |
 | JS-37 | NixOS marker owner | verified | Structured journal format | Integrated flake check passed. Two-boot guest tested switch, rollback and marker navigation |
 | JS-38 | Integrator and VM owner | verified | JS-37 marker fields | Flake and PTY passed. Ordinary guest user saw hello removed on switch and restored on rollback |
-| JS-39 | Integrator | active | Flake package and pins | Supply declarative NixOS host defaults and check overrides |
+| JS-39 | Integrator | verified | Flake package and pins | Full flake and two-boot guest passed, including host-configured backlog and command-line overrides |
 | JS-40 | Integrator | active | JS-35–39 | Verify each commit, capture screenshots and prepare both publication targets |
 
 ## Shared contract

@@ -66,6 +66,12 @@ Press **[** from live to land on the newest five-second interval containing a wa
 
 After an inspector jump, the brackets follow the service you jumped from. After manually selecting a log row, they search across services, starting on either side of the interval containing the row's first arrival. Navigation holds the captured minute still while intake continues. **g** returns to live, ready for a fresh capture.
 
+## NixOS host defaults
+
+Import `journalscope.nixosModules.default` into the host's NixOS modules. Setting `programs.jscope.enable = true;` installs the flake package and writes `/etc/jscope/defaults.json`. The `package` option accepts a package override. `backlog` defaults to 200, and `pinnedUnits` (up to two distinct names) and `mutedUnits` (up to 128) default to empty lists.
+
+A command-line `--backlog`, repeated `--pin-unit`, or repeated `--mute-unit` replaces the corresponding host setting for this run. Other host settings still apply. Use `--no-defaults` to ignore the file entirely. Replay uses display pins and mutes. Backlog applies only to live journalctl input. The optional generation marker can be enabled independently of installing the dashboard.
+
 ## NixOS activation markers
 
 Import the flake's default NixOS module and set `programs.jscope.generationMarkers.enable = true;` to record system activations. Each boot gets one journal entry identifying the booted system closure. A live switch, test activation, or rollback to a different closure records both store paths. Equal-closure reactivation and dry activation produce no marker. Enable the option in the configurations you want to track.

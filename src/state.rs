@@ -850,10 +850,14 @@ impl State {
         if self.pins.remove(unit.as_str()) {
             return Ok(());
         }
-        if self.pins.len() == MAX_PINS {
+        self.pin_unit(unit)
+    }
+
+    pub fn pin_unit(&mut self, unit: &str) -> Result<(), &'static str> {
+        if !self.is_pinned(unit) && self.pins.len() == MAX_PINS {
             return Err("Two services are pinned. Unpin one first");
         }
-        self.pins.insert(unit.as_str().into());
+        self.pins.insert(unit.into());
         Ok(())
     }
 
