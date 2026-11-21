@@ -1,7 +1,7 @@
 use jscope::{
     journal::{Decoder, Frame, MAX_LINE_BYTES, UnitField},
     source::{Source, SourceMessage},
-    state::{Grouping, State},
+    state::{BinSeverity, Grouping, State},
 };
 use std::{io::BufReader, path::Path, time::Duration};
 
@@ -61,6 +61,12 @@ fn synthetic_replay_shows_the_noisy_muted_unit_and_its_warning() {
     let activity = state.activity();
     assert_eq!(activity, adjacent.activity());
     assert_eq!(activity.len(), 2);
+    assert!(activity.iter().all(|unit| !unit.rising));
+    assert!(
+        activity
+            .iter()
+            .all(|unit| unit.severity[11] == BinSeverity::Warning)
+    );
     assert_eq!(activity[0].unit, "indexer.service");
     assert_eq!(
         (
@@ -106,6 +112,79 @@ fn synthetic_replay_shows_the_noisy_muted_unit_and_its_warning() {
     state.advance(62_000);
     assert!(state.activity().is_empty());
     assert_eq!(state.visible_rows().count(), 3);
+}
+
+#[test]
+fn lower_ranked_service_signals_a_filtered_error_burst_on_intake_time() {
+    fn replay_batch(state: &mut State, at: u64, unit: &str, priority: u8, count: usize) {
+        let line = serde_json::json!({
+            "_SYSTEMD_UNIT": unit,
+            "PRIORITY": priority.to_string(),
+            "MESSAGE": "tick",
+        });
+        let text = format!("{line}\n").repeat(count);
+        let mut decoder = Decoder::new(text.as_bytes(), MAX_LINE_BYTES);
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            let Frame::Event(event) = frame else {
+                panic!("expected a journal entry");
+            };
+            state.ingest(event, at);
+        }
+    }
+
+    let mut state = State::default();
+    state.set_search("steady");
+    state.set_unit_muted("worker.service", true).unwrap();
+    for second in 0..=65 {
+        let at = second * 1_000;
+        replay_batch(&mut state, at, "steady.service", 6, 1);
+        match second {
+            1 => replay_batch(&mut state, at, "worker.service", 6, 1),
+            25 => replay_batch(&mut state, at, "worker.service", 6, 17),
+            59 => replay_batch(&mut state, at, "worker.service", 4, 1),
+            64 => {
+                for priority in [4, 3, 6] {
+                    replay_batch(&mut state, at, "worker.service", priority, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The oldest worker arrival is outside the graph but inside the rate comparison.
+    // Three arrivals in five seconds fall just short of doubling 19 per minute.
+    state.advance(65_999);
+    let before = state.activity();
+    assert_eq!(before[1].incoming, 21);
+    assert!(!before[1].rising);
+
+    // Once that arrival expires, three in five seconds is exactly double 18/min.
+    state.advance(66_000);
+    let after = state.activity();
+    assert_eq!(after[0].unit, "steady.service");
+    assert!(!after[0].rising);
+    let worker = &after[1];
+    assert_eq!(worker.unit, "worker.service");
+    assert!(worker.rising);
+    assert_eq!(
+        (worker.incoming, worker.visible, worker.suppressed),
+        (21, 0, 21)
+    );
+    assert_eq!(&worker.sparkline[10..], &[1, 3]);
+    assert_eq!(
+        &worker.severity[10..],
+        &[BinSeverity::Warning, BinSeverity::Error]
+    );
+
+    state.advance(69_000);
+    assert!(!state.activity()[1].rising);
+    state.advance(124_000);
+    assert!(
+        state
+            .activity()
+            .iter()
+            .all(|unit| unit.unit != "worker.service")
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use crate::state::{Group, Grouping, SPARK_BINS, State, UnitActivity};
+use crate::state::{BinSeverity, Group, Grouping, SPARK_BINS, State, UnitActivity};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -109,13 +109,15 @@ fn render_header(
         Layout::horizontal([Constraint::Length(title_width), Constraint::Min(0)]).areas(area);
     frame.render_widget(title, identity);
     let mut bins = [0; SPARK_BINS];
+    let mut severity = [BinSeverity::Normal; SPARK_BINS];
     let mut incoming = 0;
     let mut visible = 0;
     for entry in activity {
         incoming += entry.incoming;
         visible += entry.visible;
-        for (total, count) in bins.iter_mut().zip(entry.sparkline) {
-            *total += count;
+        for (i, total) in bins.iter_mut().enumerate() {
+            *total += entry.sparkline[i];
+            severity[i] = severity[i].max(entry.severity[i]);
         }
     }
     let width = usize::from(metrics.width.saturating_sub(1));
@@ -141,9 +143,13 @@ fn render_header(
             ));
         }
         if graph_width >= 3 {
-            spans.push(Span::styled(
-                sparkline(&bins, graph_width, None),
+            spans.extend(sparkline(
+                &bins,
+                &severity,
+                graph_width,
+                None,
                 colored(Color::LightCyan, no_color),
+                no_color,
             ));
             spans.push(Span::raw(" "));
         }
@@ -422,7 +428,7 @@ fn render_leader(
     entry: &UnitActivity,
     no_color: bool,
 ) {
-    let label = "↑ Noisiest ";
+    let label = "Noisiest ";
     let legend = if area.width >= 72 { " in/vis/supp" } else { "" };
     let width = usize::from(area.width).saturating_sub(label.width() + legend.len());
     let line = if entry.incoming == 0 {
@@ -458,16 +464,28 @@ fn render_activity(
     let [legend, list] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
     let dim = Style::default().add_modifier(Modifier::DIM);
-    frame.render_widget(Line::styled("  unit", dim), legend);
-    frame.render_widget(
-        Line::styled("in/visible/suppressed", dim).right_aligned(),
-        legend,
-    );
+    let key = Line::from(vec![
+        Span::styled("↑", rising_style(no_color)),
+        Span::styled(" rising ", dim),
+        spark_bar("▆", BinSeverity::Warning, dim, no_color),
+        Span::styled(" warn ", dim),
+        spark_bar("▆", BinSeverity::Error, dim, no_color),
+        Span::styled(" err+", dim),
+    ]);
+    let counts = if key.width() + 22 <= usize::from(legend.width) {
+        "in/visible/suppressed"
+    } else {
+        "in/vis/supp"
+    };
+    if key.width() + counts.len() < usize::from(legend.width) {
+        frame.render_widget(key, legend);
+    }
+    frame.render_widget(Line::styled(counts, dim).right_aligned(), legend);
     let width = usize::from(list.width.saturating_sub(2));
     let bars = trend_width(width);
     let peak = summaries
         .iter()
-        .flat_map(|entry| buckets(&entry.sparkline, bars))
+        .flat_map(|entry| buckets(&entry.sparkline, bars).map(|bin| bin.iter().sum()))
         .max();
     let selected_index = state.sidebar_index(summaries);
     let capacity = usize::from(list.height);
@@ -502,6 +520,14 @@ fn activity_spans<'a>(
     no_color: bool,
 ) -> Vec<Span<'a>> {
     let tags = unit_tags(state, &entry.unit);
+    let bars = trend_width(width);
+    let mut spans = Vec::new();
+    let width = if entry.rising {
+        spans.push(Span::styled("↑ ", rising_style(no_color)));
+        width.saturating_sub(2)
+    } else {
+        width
+    };
     let mut counts = format!("{}/{}/{}", entry.incoming, entry.visible, entry.suppressed);
     if counts.len() + 10 + tags.width() > width {
         counts = format!(
@@ -512,21 +538,26 @@ fn activity_spans<'a>(
         );
     }
     let available = width.saturating_sub(tags.width() + counts.width() + 2);
-    let bars = trend_width(width);
     let bars = if available >= bars + 4 { bars } else { 0 };
     let unit_width = available.saturating_sub(bars);
     let unit = truncate_display(&entry.unit, unit_width);
     let padding = unit_width.saturating_sub(unit.width());
-    vec![
-        Span::styled(unit, unit_style(&entry.unit, no_color)),
+    let style = unit_style(&entry.unit, no_color);
+    spans.extend([
+        Span::styled(unit, style),
         Span::styled(tags, colored(Color::LightYellow, no_color)),
         Span::raw(" ".repeat(padding + 1)),
-        Span::styled(
-            sparkline(&entry.sparkline, bars, peak),
-            unit_style(&entry.unit, no_color),
-        ),
-        Span::raw(format!(" {counts}")),
-    ]
+    ]);
+    spans.extend(sparkline(
+        &entry.sparkline,
+        &entry.severity,
+        bars,
+        peak,
+        style,
+        no_color,
+    ));
+    spans.push(Span::raw(format!(" {counts}")));
+    spans
 }
 
 fn render_details(
@@ -722,27 +753,58 @@ fn trend_width(width: usize) -> usize {
     }
 }
 
-fn buckets(bins: &[u64; SPARK_BINS], bars: usize) -> impl Iterator<Item = u64> + '_ {
-    (0..bars).map(move |i| {
-        bins[i * SPARK_BINS / bars..(i + 1) * SPARK_BINS / bars]
-            .iter()
-            .sum()
-    })
+fn buckets<T>(bins: &[T; SPARK_BINS], bars: usize) -> impl Iterator<Item = &[T]> + Clone {
+    (0..bars).map(move |i| &bins[i * SPARK_BINS / bars..(i + 1) * SPARK_BINS / bars])
 }
 
-fn sparkline(bins: &[u64; SPARK_BINS], bars: usize, peak: Option<u64>) -> String {
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let max = peak.unwrap_or_else(|| buckets(bins, bars).max().unwrap_or(0));
-    buckets(bins, bars)
-        .map(|count| {
-            if count == 0 {
-                '·'
+fn rising_style(no_color: bool) -> Style {
+    colored(Color::LightGreen, no_color).add_modifier(Modifier::BOLD)
+}
+
+fn spark_bar(
+    height: &'static str,
+    severity: BinSeverity,
+    normal: Style,
+    no_color: bool,
+) -> Span<'static> {
+    let (symbol, color) = match severity {
+        BinSeverity::Normal => return Span::styled(height, normal),
+        BinSeverity::Warning => ("!", Color::LightYellow),
+        BinSeverity::Error => ("×", Color::LightRed),
+    };
+    Span::styled(
+        if no_color { symbol } else { height },
+        colored(color, no_color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn sparkline<'a>(
+    bins: &'a [u64; SPARK_BINS],
+    severity: &'a [BinSeverity; SPARK_BINS],
+    bars: usize,
+    peak: Option<u64>,
+    normal: Style,
+    no_color: bool,
+) -> impl Iterator<Item = Span<'a>> + 'a {
+    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let counts = buckets(bins, bars).map(|bin| bin.iter().sum::<u64>());
+    let max = peak.unwrap_or_else(|| counts.clone().max().unwrap_or(0));
+    counts
+        .zip(buckets(severity, bars))
+        .map(move |(count, severities)| {
+            let height = if count == 0 {
+                "·"
             } else {
                 let bar = (count as u128 * 7 / max as u128) as usize;
                 LEVELS[bar]
-            }
+            };
+            spark_bar(
+                height,
+                severities.iter().copied().max().unwrap_or_default(),
+                normal,
+                no_color,
+            )
         })
-        .collect()
 }
 
 fn severity(priority: Option<u8>, no_color: bool) -> (&'static str, Style) {
@@ -791,6 +853,7 @@ mod tests {
     use crate::journal::{Event, UnitField, UnitMetadata};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::{Buffer, Cell};
 
     fn event(message: &str, priority: u8, realtime_us: u64) -> Event {
         Event {
@@ -804,20 +867,32 @@ mod tests {
         }
     }
 
-    fn screen(width: u16, height: u16, state: &State, status: &Status<'_>) -> Vec<String> {
+    fn render_buffer(
+        width: u16,
+        height: u16,
+        state: &State,
+        status: &Status<'_>,
+        no_color: bool,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, state, status, true);
+                render(frame, state, status, no_color);
             })
             .unwrap();
-        terminal
-            .backend()
-            .buffer()
+        terminal.backend().buffer().clone()
+    }
+
+    fn lines(buffer: &Buffer) -> Vec<String> {
+        buffer
             .content()
-            .chunks(usize::from(width))
+            .chunks(usize::from(buffer.area.width))
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
+    }
+
+    fn screen(width: u16, height: u16, state: &State, status: &Status<'_>) -> Vec<String> {
+        lines(&render_buffer(width, height, state, status, true))
     }
 
     #[test]
@@ -956,7 +1031,7 @@ mod tests {
             source: "journalctl",
             ..Default::default()
         };
-        let view = screen(144, 24, &state, &status);
+        let view = lines(&render_buffer(144, 24, &state, &status, false));
         assert!(view[0].contains("█··········▁ 9/min"), "{}", view[0]);
         assert!(view[0].contains("▰▱▱▱▱▱▱▱ 11% shown"), "{}", view[0]);
         // The older burst and the single fresh event should have different heights.
@@ -975,6 +1050,73 @@ mod tests {
         let view = screen(80, 24, &state, &status);
         assert!(view[0].contains("Quiet"));
         assert!(view.iter().any(|row| row.contains("WARN alarm")));
+    }
+
+    #[test]
+    fn rising_and_severity_survive_filtering_and_chart_compression() {
+        let mut state = State::default();
+        for (at, priority) in [(15_000, 6), (20_000, 4), (25_000, 4)] {
+            state.ingest(event("activity", priority, at * 1_000), at);
+        }
+        let mut quiet = event("other error", 3, 25_000_000);
+        quiet.unit = "quiet.service".into();
+        state.ingest(quiet, 25_000);
+        for priority in [3, 6, 7] {
+            state.ingest(event("activity", priority, 30_000_000), 30_000);
+        }
+        state.set_search("hide everything");
+
+        fn chart_before<'a>(row: &'a [Cell], suffix: &str, bars: usize) -> &'a [Cell] {
+            let text: String = row.iter().map(|cell| cell.symbol()).collect();
+            let end = text[..text.find(suffix).unwrap()].width();
+            &row[end - bars..end]
+        }
+
+        for (width, service_row, bars, label) in [
+            (80, 1, 12, "Noisiest ↑ noisy.service"),
+            (104, 3, 6, "› ↑ noisy.service"),
+        ] {
+            let status = Status {
+                service_focus: width == 104,
+                ..Default::default()
+            };
+            for no_color in [false, true] {
+                let buffer = render_buffer(width, 24, &state, &status, no_color);
+                let display = lines(&buffer);
+                assert!(
+                    display[service_row].contains(label),
+                    "{}",
+                    display[service_row]
+                );
+                assert!(!display.iter().any(|line| line.contains("↑ quiet.service")));
+                let mut rows = buffer.content().chunks(usize::from(width));
+                let header_chart = chart_before(rows.next().unwrap(), " 7/min", SPARK_BINS);
+                // Only quiet.service logged an error in this five-second header bin.
+                let from_other = &header_chart[10];
+                let chart = chart_before(rows.nth(service_row - 1).unwrap(), " 6/0/6", bars);
+                // At six columns, the final pair of bins contains both a warning and an error.
+                let warning = &chart[bars - 2];
+                let error = &chart[bars - 1];
+                if no_color {
+                    assert_eq!(
+                        (warning.symbol(), error.symbol(), from_other.symbol()),
+                        ("!", "×", "×")
+                    );
+                    assert!(buffer.content().iter().all(|cell| cell.fg == Color::Reset));
+                } else {
+                    assert_eq!(warning.fg, Color::LightYellow);
+                    assert_eq!(error.fg, Color::LightRed);
+                    assert_eq!(from_other.fg, Color::LightRed);
+                    assert!(warning.modifier.contains(Modifier::BOLD));
+                    assert!(error.modifier.contains(Modifier::BOLD));
+                    assert_eq!(warning.symbol(), if bars == 12 { "▃" } else { "▄" });
+                    assert_eq!(error.symbol(), "█");
+                }
+            }
+        }
+        state.advance(35_000);
+        let view = screen(80, 24, &state, &Status::default());
+        assert!(view[1].starts_with("Noisiest noisy.service"), "{}", view[1]);
     }
 
     #[test]
@@ -1126,7 +1268,7 @@ mod tests {
             .collect();
         assert!(display.contains("3600/1200/2400"), "{display}");
         assert!(display.contains("[muted]"), "{display}");
-        assert!(display.contains("█"), "{display}");
+        assert!(display.contains("! 3600/1200/2400"), "{display}");
     }
 
     #[test]

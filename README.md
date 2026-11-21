@@ -22,6 +22,9 @@ Use `--unit` for system services or `--user-unit` for user services. Both option
 
 The service list ranks units by incoming activity. The service graphs share a scale so you can compare bursts across rows. Each row shows its trend and three counts in the order incoming / visible / suppressed. On a narrow terminal, the busiest service stays above the full-width tail. Press Tab for the complete ranking or to return to the log. At 104 columns and wider, the ranking stays beside the log.
 
+- **↑ beside a unit** means it received at least three entries in the last five seconds, at a rate at least twice its average over the preceding minute. After 15 seconds of observation, the arrow can use the portion of that minute already observed. A previously quiet unit can qualify. The comparison pauses if its history is incomplete after a buffer eviction.
+- **Amber and red bars** mark time intervals containing a warning or an error, respectively. Critical, alert and emergency entries also turn the bar red. Height still shows volume, and the most severe entry sets the color. With `--no-color`, `!` marks a warning and `×` marks an error or higher. These markers follow incoming events even while a search, mute or solo hides the corresponding log rows.
+
 ## Try a synthetic replay
 
 ```sh
@@ -29,6 +32,12 @@ nix run . -- --input fixtures/demo.jsonl --mute-unit indexer.service
 ```
 
 For the first 60 seconds, `indexer.service` leads with nine incoming entries, two visible, and seven suppressed. Its two warnings collapse into one row. The notice from `proxy.service` also stays visible. Press Enter to inspect the repeated warning. Press Tab to focus services and Shift+M to unmute the indexer.
+
+To see the rising-rate indicator with synthetic input, send the fixture again after a quiet interval. Watch the indexer gain `↑` for five seconds when the second burst arrives. The warning bars from both bursts remain in the graph as they age.
+
+```sh
+nix build && { cat fixtures/demo.jsonl; sleep 18; cat fixtures/demo.jsonl; } | ./result/bin/jscope --input -
+```
 
 To see burst grouping, run `nix run . -- --input fixtures/demo.jsonl`. Four “Polling job queue” entries share one `indexer` row marked `×4/800ms`, and the interleaved proxy warning has its own row. Add `--adjacent-only` to see where the warning interrupted the polling stream.
 

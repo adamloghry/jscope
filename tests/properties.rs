@@ -1,7 +1,7 @@
 use hegel::{TestCase, generators as gs};
 use jscope::{
     journal::{Decoder, Event, Frame, UnitField, UnitMetadata},
-    state::{Grouping, State, UnitActivity},
+    state::{BinSeverity, Grouping, State, UnitActivity},
 };
 use serde_json::json;
 use std::{collections::BTreeMap, io::BufReader};
@@ -179,8 +179,8 @@ fn action(tc: &TestCase) -> Action {
             priority: if interleaved {
                 Some(6)
             } else {
-                [None, Some(3), Some(4), Some(5), Some(7)]
-                    [tc.draw(gs::integers::<usize>().max_value(4))]
+                let priority = tc.draw(gs::integers::<u8>().max_value(8));
+                (priority < 8).then_some(priority)
             },
             step_ms: [0, 1, 2_500, 2_501, 4_999, 5_000]
                 [tc.draw(gs::integers::<usize>().max_value(5))],
@@ -192,7 +192,9 @@ fn action(tc: &TestCase) -> Action {
             ][tc.draw(gs::integers::<usize>().max_value(2))],
         },
         5 => Action::Advance(
-            [0, 1, 4_999, 5_000, 59_999, 60_000][tc.draw(gs::integers::<usize>().max_value(5))],
+            [
+                0, 1, 4_999, 5_000, 14_999, 15_000, 59_999, 60_000, 64_999, 65_000,
+            ][tc.draw(gs::integers::<usize>().max_value(9))],
         ),
         6 => Action::Mute(tc.draw(gs::booleans())),
         7 => Action::Solo(tc.draw(gs::booleans()).then(|| UNITS[choice()])),
@@ -326,7 +328,28 @@ impl Model {
                 } else {
                     counts.suppressed += 1;
                 }
-                counts.sparkline[11 - (age / 5_000) as usize] += 1;
+                let bin = 11 - (age / 5_000) as usize;
+                counts.sparkline[bin] += 1;
+                let severity = match event.priority {
+                    Some(0..=3) => BinSeverity::Error,
+                    Some(4) => BinSeverity::Warning,
+                    _ => BinSeverity::Normal,
+                };
+                counts.severity[bin] = counts.severity[bin].max(severity);
+            }
+        }
+        let observed_ms = self.now.saturating_sub(5_000).min(WINDOW);
+        if observed_ms >= 10_000 {
+            for unit in by_unit.values_mut() {
+                let baseline = self
+                    .events
+                    .iter()
+                    .filter(|(at, event)| {
+                        unit.unit == event.unit && (5_000..65_000).contains(&(self.now - at))
+                    })
+                    .count() as u64;
+                let threshold = (baseline * 10_000).div_ceil(observed_ms).max(3);
+                unit.rising = unit.sparkline[11] >= threshold;
             }
         }
         let mut result: Vec<_> = by_unit.into_values().collect();

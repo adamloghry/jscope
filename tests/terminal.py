@@ -151,6 +151,8 @@ def test_replay(binary):
         send("loud.service", 6, "LOUD_HIDDEN")
         contents = wait_for("ANCHOR_WATCH", "QUIET_INFO_WATCH", "2/1/1", "3/min")
         assert "LOUD_HIDDEN" not in contents
+        loud = next(row for row in contents.splitlines() if "2/1/1" in row)
+        assert "!" in loud and "↑ loud.service" not in loud, contents
 
         keys(b" ")
         wait_for("Paused")
@@ -182,6 +184,13 @@ def test_replay(binary):
         scope.stdin.write(b"this is not JSON\n")
         scope.stdin.flush()
         wait_for("1 malformed", "7/min", "QUIET_FILTERED")
+
+        # The graphs keep the highest incoming severity even when search hides that row.
+        keys(b"/quiet\r")
+        send("loud.service", 3, "LOUD_ERROR_UNMATCHED")
+        contents = wait_for("8/min", "6/0/6", absent=("LOUD_ERROR_UNMATCHED",))
+        loud = next(row for row in contents.splitlines() if "6/0/6" in row)
+        assert "×" in loud and "×" in contents.splitlines()[0], contents
         # Leave stdin open so quitting must interrupt the waiting reader.
 
 
@@ -199,6 +208,8 @@ def test_grouped_demo(binary, fixture):
             assert all("indexer" in row.split() and ".service" not in row for row in rows), contents
             assert "proxy WARN Backend latency above target" in contents, contents
             assert "indexer.service" in contents, contents  # Full name in the activity strip.
+            leader = next(line for line in contents.splitlines() if "Noisiest" in line)
+            assert "!" in leader and "↑ indexer.service" not in leader, contents
             keys(b"\x1b[A" * 10 + b"\r")
             wait_for("_SYSTEMD_UNIT=indexer.service", f"Latest cursor {latest_cursor}")
 

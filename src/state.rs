@@ -6,6 +6,9 @@ use std::sync::Arc;
 pub const WINDOW_MS: u64 = 60_000;
 pub const SPARK_BINS: usize = 12;
 const BIN_MS: u64 = WINDOW_MS / SPARK_BINS as u64;
+const COMPARISON_WINDOW_MS: u64 = BIN_MS + WINDOW_MS;
+const MIN_BASELINE_MS: u64 = 10_000;
+const MIN_RISING_COUNT: u64 = 3;
 const BURST_WINDOW_MS: u64 = 5_000;
 const BURST_DISTANCE: usize = 8;
 const MAX_ROW_BYTES: usize = 12 * 1024 * 1024;
@@ -106,6 +109,24 @@ struct Intake {
     count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum BinSeverity {
+    #[default]
+    Normal,
+    Warning,
+    Error,
+}
+
+impl BinSeverity {
+    fn from_priority(priority: Option<u8>) -> Self {
+        match priority {
+            Some(0..=3) => Self::Error,
+            Some(4) => Self::Warning,
+            _ => Self::Normal,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnitActivity {
     pub unit: String,
@@ -114,6 +135,10 @@ pub struct UnitActivity {
     pub suppressed: u64,
     /// Counts in five-second bins, oldest first.
     pub sparkline: [u64; SPARK_BINS],
+    /// Highest incoming severity in each corresponding sparkline bin.
+    pub severity: [BinSeverity; SPARK_BINS],
+    /// The most recent five seconds have at least three arrivals and twice the baseline rate.
+    pub rising: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -135,6 +160,7 @@ pub struct State {
     max_rows: usize,
     max_activity: usize,
     now: u64,
+    last_activity_drop_at: Option<u64>,
     counters: Counters,
     first_host: Option<String>,
     multiple_hosts: bool,
@@ -167,6 +193,7 @@ impl State {
             max_rows,
             max_activity,
             now: 0,
+            last_activity_drop_at: None,
             counters: Counters::default(),
             first_host: None,
             multiple_hosts: false,
@@ -188,7 +215,7 @@ impl State {
         while self
             .intake
             .front()
-            .is_some_and(|entry| self.now - entry.at >= WINDOW_MS)
+            .is_some_and(|entry| self.now - entry.at >= COMPARISON_WINDOW_MS)
         {
             self.pop_intake();
         }
@@ -227,7 +254,10 @@ impl State {
         });
         while self.intake.len() > self.max_activity || self.activity_bytes > MAX_ACTIVITY_BYTES {
             let removed = self.pop_intake();
-            self.counters.activity_dropped += removed.count;
+            self.last_activity_drop_at = Some(removed.at);
+            if self.now - removed.at < WINDOW_MS {
+                self.counters.activity_dropped += removed.count;
+            }
         }
     }
 
@@ -296,8 +326,12 @@ impl State {
         self.grouping = grouping;
     }
 
+    /// Number of retained intake records contributing to the displayed 60-second window.
     pub fn activity_len(&self) -> usize {
         self.intake.len()
+            - self
+                .intake
+                .partition_point(|entry| self.now - entry.at >= WINDOW_MS)
     }
 
     pub fn counters(&self) -> Counters {
@@ -328,26 +362,29 @@ impl State {
     }
 
     fn summarize(&self, include_muted_units: bool) -> Vec<UnitActivity> {
-        let mut totals = BTreeMap::<&str, UnitActivity>::new();
+        let mut totals = BTreeMap::<&str, (UnitActivity, u64)>::new();
         if include_muted_units {
-            totals.extend(self.muted_units.iter().map(|unit| {
-                (
-                    unit.as_ref(),
-                    UnitActivity {
-                        unit: unit.to_string(),
-                        ..Default::default()
-                    },
-                )
-            }));
+            totals.extend(
+                self.muted_units
+                    .iter()
+                    .map(|unit| (unit.as_ref(), Default::default())),
+            );
         }
-        for entry in &self.intake {
+        // Visit active units first. The extra five seconds only extend their rate baselines.
+        for entry in self.intake.iter().rev() {
             let unit = entry.event.unit.as_str();
-            let summary = totals.entry(unit).or_insert_with(|| UnitActivity {
-                unit: unit.to_owned(),
-                ..Default::default()
-            });
-            let bin = SPARK_BINS - 1 - ((self.now - entry.at) / BIN_MS) as usize;
+            let age = self.now - entry.at;
+            if age >= WINDOW_MS {
+                if let Some((_, extra)) = totals.get_mut(unit) {
+                    *extra += entry.count;
+                }
+                continue;
+            }
+            let (summary, _) = totals.entry(unit).or_default();
+            let bin = SPARK_BINS - 1 - (age / BIN_MS) as usize;
             summary.sparkline[bin] += entry.count;
+            summary.severity[bin] =
+                summary.severity[bin].max(BinSeverity::from_priority(entry.event.priority));
             summary.incoming += entry.count;
             if self.matches(&entry.event) {
                 summary.visible += entry.count;
@@ -355,7 +392,24 @@ impl State {
                 summary.suppressed += entry.count;
             }
         }
-        let mut totals: Vec<_> = totals.into_values().collect();
+        let baseline_ms = self.now.saturating_sub(BIN_MS).min(WINDOW_MS);
+        let baseline_ready = baseline_ms >= MIN_BASELINE_MS
+            && self
+                .last_activity_drop_at
+                .is_none_or(|at| self.now - at >= COMPARISON_WINDOW_MS);
+        let mut totals: Vec<_> = totals
+            .into_iter()
+            .map(|(unit, (mut summary, extra))| {
+                let recent = summary.sparkline[SPARK_BINS - 1];
+                let baseline = summary.incoming - recent + extra;
+                summary.rising = baseline_ready
+                    && recent >= MIN_RISING_COUNT
+                    && u128::from(recent) * u128::from(baseline_ms)
+                        >= 2 * u128::from(baseline) * u128::from(BIN_MS);
+                summary.unit = unit.to_owned();
+                summary
+            })
+            .collect();
         totals.sort_unstable_by(|a, b| {
             b.incoming
                 .cmp(&a.incoming)
@@ -617,6 +671,107 @@ mod tests {
             unit_metadata: Default::default(),
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn rising_requires_a_warmed_baseline_three_arrivals_and_twice_the_rate() {
+        let mut state = State::default();
+        let e = event("api", 6, "poll", 0);
+        for _ in 0..4 {
+            state.ingest(e.clone(), 0);
+        }
+        for _ in 0..3 {
+            state.ingest(e.clone(), 14_999);
+        }
+        assert!(!state.activity()[0].rising);
+        state.advance(15_000);
+        assert!(!state.activity()[0].rising);
+        state.ingest(e.clone(), 15_000);
+        // Four in five seconds, four in the preceding ten observed seconds.
+        assert!(state.activity()[0].rising);
+        state.set_search("absent");
+        state.set_muted(true);
+        state.set_paused(true);
+        assert!(state.activity()[0].rising);
+        state.advance(19_999);
+        assert!(!state.activity()[0].rising);
+
+        let mut quiet = State::default();
+        for _ in 0..2 {
+            quiet.ingest(e.clone(), 15_000);
+        }
+        assert!(!quiet.activity()[0].rising);
+        quiet.ingest(e, 15_000);
+        assert!(quiet.activity()[0].rising);
+    }
+
+    #[test]
+    fn comparison_includes_history_beyond_the_displayed_minute() {
+        let mut state = State::default();
+        let e = event("api", 6, "poll", 0);
+        for _ in 0..19 {
+            state.ingest(e.clone(), 0);
+        }
+        state.ingest(event("idle", 4, "warn", 0), 0);
+        for _ in 0..3 {
+            state.ingest(e.clone(), 64_999);
+        }
+        let entries = state.activity();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].incoming, 3);
+        assert!(!entries[0].rising);
+        assert_eq!(state.activity_len(), 1);
+        state.advance(65_000);
+        assert!(state.activity()[0].rising);
+        state.advance(69_999);
+        assert!(!state.activity()[0].rising);
+    }
+
+    #[test]
+    fn severity_bins_keep_the_most_urgent_arrival_under_display_filters() {
+        let mut state = State::default();
+        state.ingest(event("api", 4, "caution", 0), 0);
+        for priority in [3, 4, 7] {
+            state.ingest(event("api", priority, "event", 0), 5_000);
+        }
+        state.ingest(event("api", 5, "notice", 0), 10_000);
+        state.set_solo(Some("db".into()));
+        let summary = &state.activity()[0];
+        assert_eq!((summary.incoming, summary.visible), (5, 0));
+        assert_eq!(
+            &summary.severity[SPARK_BINS - 3..],
+            &[
+                BinSeverity::Warning,
+                BinSeverity::Error,
+                BinSeverity::Normal
+            ]
+        );
+        assert_eq!(&summary.sparkline[SPARK_BINS - 3..], &[1, 3, 1]);
+        state.advance(60_000);
+        assert!(!state.activity()[0].severity.contains(&BinSeverity::Warning));
+        state.advance(65_000);
+        assert_eq!(
+            state.activity()[0].severity,
+            [BinSeverity::Normal; SPARK_BINS]
+        );
+    }
+
+    #[test]
+    fn dropping_baseline_only_history_suspends_rate_arrows_until_it_expires() {
+        let mut state = State::new(5, 2);
+        let e = event("api", 6, "poll", 0);
+        let start = u64::MAX - COMPARISON_WINDOW_MS;
+        state.ingest(event("old", 6, "poll", 0), start);
+        state.ingest(event("other", 6, "tick", 0), start + 60_000);
+        for _ in 0..3 {
+            state.ingest(e.clone(), u64::MAX - 1);
+        }
+        assert_eq!(state.counters().activity_dropped, 0);
+        assert_eq!(state.intake.len(), 2);
+        assert_eq!(state.activity()[0].incoming, 3);
+        assert!(!state.activity()[0].rising);
+        state.advance(u64::MAX);
+        assert!(state.activity()[0].rising);
     }
 
     #[test]
