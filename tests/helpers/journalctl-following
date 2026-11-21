@@ -1,0 +1,13 @@
+#!/bin/sh
+expected='--follow --output=json --no-pager --lines=17 --unit=demo.service --unit=other@*.service --user-unit=client.service --boot=-1 --priority=warning..alert'
+if [ "$*" != "$expected" ] || [ "$#" -ne 9 ]; then
+    printf 'unexpected journalctl argument list: %s\n' "$*" >&2
+    exit 1
+fi
+printf '{"MESSAGE":"following","_SYSTEMD_UNIT":"demo.service","PRIORITY":"4"}\n'
+i=0
+while [ "$i" -lt 10000 ]; do
+    printf '{"MESSAGE":"next record","PRIORITY":"6"}\n'
+    i=$((i + 1))
+done
+exec sleep 120

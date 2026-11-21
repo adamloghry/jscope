@@ -1,0 +1,5 @@
+{"_SYSTEMD_USER_UNIT":["client.service","ignored.service"],"_SYSTEMD_UNIT":"session.scope","PRIORITY":[null,"4","6"],"_HOSTNAME":[100,101,109,111],"MESSAGE":[[27,91,50,74,255],[65]],"__CURSOR":"first","__REALTIME_TIMESTAMP":["bad","1234"]}
+{incomplete
+{"_SYSTEMD_UNIT":null,"SYSLOG_IDENTIFIER":"legacy","_COMM":"fallback","MESSAGE":"line\nbackslash \\ and U+009B \u009b"}
+{"_SYSTEMD_USER_UNIT":[null,""],"_SYSTEMD_UNIT":{"bad":true},"SYSLOG_IDENTIFIER":[[],null],"_COMM":[[116,97,105,108],"ignored"],"PRIORITY":[530,4],"MESSAGE":"from command"}
+{"MESSAGE":null}

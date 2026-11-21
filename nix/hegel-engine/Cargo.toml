@@ -1,0 +1,12 @@
+[package]
+name = "jscope-hegel-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "hegel_c"
+crate-type = ["cdylib"]
+
+[dependencies]
+hegeltest-c = "=0.51.6"
