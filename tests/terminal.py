@@ -185,6 +185,25 @@ def test_replay(binary):
         # Leave stdin open so quitting must interrupt the waiting reader.
 
 
+def test_grouped_demo(binary, fixture):
+    for options, repeat, polling_rows, latest_cursor in (
+        ([], "×4/800ms", 3, "demo-05"),
+        (["--adjacent-only"], "×3/400ms", 4, "demo-03"),
+    ):
+        command = [binary, "--input", fixture, "--no-color", *options]
+        with terminal(command, columns=80, lines=24) as (_, keys, wait_for):
+            contents = wait_for("replay complete", "11/min", "9/9/0", repeat)
+            rows = [line for line in contents.splitlines() if "Polling job queue" in line]
+            assert len(rows) == polling_rows, contents
+            assert repeat in rows[0], contents
+            assert all("indexer" in row.split() and ".service" not in row for row in rows), contents
+            assert "proxy WARN Backend latency above target" in contents, contents
+            assert "indexer.service" in contents, contents  # Full name in the activity strip.
+            keys(b"\x1b[A" * 10 + b"\r")
+            wait_for("_SYSTEMD_UNIT=indexer.service", f"Latest cursor {latest_cursor}")
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
+    test_grouped_demo(sys.argv[1], sys.argv[2])

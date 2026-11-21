@@ -1,7 +1,7 @@
 use jscope::{
     journal::{Decoder, Frame, MAX_LINE_BYTES, UnitField},
     source::{Source, SourceMessage},
-    state::State,
+    state::{Grouping, State},
 };
 use std::{io::BufReader, path::Path, time::Duration};
 
@@ -12,13 +12,17 @@ fn synthetic_replay_shows_the_noisy_muted_unit_and_its_warning() {
     let bytes = include_bytes!("../fixtures/demo.jsonl");
     let mut decoder = Decoder::new(BufReader::new(&bytes[..]), MAX_LINE_BYTES);
     let mut state = State::default();
+    let mut adjacent = State::default();
+    adjacent.set_grouping(Grouping::Adjacent);
     state.set_unit_muted("indexer.service", true).unwrap();
+    adjacent.set_unit_muted("indexer.service", true).unwrap();
 
     let mut at = 0;
     while let Some(frame) = decoder.next_frame().unwrap() {
         let Frame::Event(event) = frame else {
             panic!("demo must contain only journal records");
         };
+        adjacent.ingest(event.clone(), at);
         state.ingest(event, at);
         at += 200;
     }
@@ -26,7 +30,36 @@ fn synthetic_replay_shows_the_noisy_muted_unit_and_its_warning() {
     assert_eq!(state.counters().received, 11);
     assert!(!state.show_hosts());
 
+    // The proxy warning interrupts the first four polls. The following
+    // indexer lease and warning break the indexer's own polling groups.
+    let groups = |state: &State| {
+        state
+            .rows()
+            .iter()
+            .map(|row| (row.id, row.count))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        groups(&state),
+        [(1, 4), (4, 1), (6, 1), (7, 1), (8, 1), (9, 2), (11, 1)]
+    );
+    assert_eq!(
+        groups(&adjacent),
+        [
+            (1, 3),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+            (8, 1),
+            (9, 2),
+            (11, 1)
+        ]
+    );
+    assert_eq!(state.rows()[0].last.cursor.as_deref(), Some("demo-05"));
+    assert_eq!(adjacent.rows()[0].last.cursor.as_deref(), Some("demo-03"));
     let activity = state.activity();
+    assert_eq!(activity, adjacent.activity());
     assert_eq!(activity.len(), 2);
     assert_eq!(activity[0].unit, "indexer.service");
     assert_eq!(

@@ -73,7 +73,7 @@
             terminal = pkgs.runCommand "jscope-terminal"
               { nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyte ])) ]; }
               ''
-                python ${./tests/terminal.py} "${lib.getExe binary}"
+                python ${./tests/terminal.py} "${lib.getExe binary}" "${./fixtures/demo.jsonl}"
                 touch "$out"
               '';
             fmt = pkgs.runCommand "jscope-fmt"

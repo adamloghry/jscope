@@ -1,7 +1,7 @@
 use hegel::{TestCase, generators as gs};
 use jscope::{
     journal::{Decoder, Event, Frame, UnitField, UnitMetadata},
-    state::{State, UnitActivity},
+    state::{Grouping, State, UnitActivity},
 };
 use serde_json::json;
 use std::{collections::BTreeMap, io::BufReader};
@@ -133,6 +133,13 @@ fn journal_record(variant: u8, number: usize) -> (Vec<u8>, Frame) {
     (line, Frame::Event(event))
 }
 
+#[derive(Clone, Copy, Debug)]
+enum JournalClock {
+    Forward,
+    Backward,
+    Missing,
+}
+
 #[derive(Debug)]
 enum Action {
     Burst {
@@ -142,6 +149,8 @@ enum Action {
         message: usize,
         priority: Option<u8>,
         step_ms: u64,
+        interleaved: bool,
+        clock: JournalClock,
     },
     Advance(u64),
     Mute(bool),
@@ -154,17 +163,33 @@ enum Action {
 
 #[hegel::composite]
 fn action(tc: &TestCase) -> Action {
-    let variant = tc.draw(gs::integers::<u8>().max_value(11));
+    let variant = tc.draw(gs::integers::<u8>().max_value(12));
+    let interleaved = variant == 12;
     let choice = || tc.draw(gs::integers::<usize>().max_value(2));
     match variant {
-        0..=4 => Action::Burst {
-            count: tc.draw(gs::integers::<usize>().min_value(1).max_value(12)),
+        0..=4 | 12 => Action::Burst {
+            count: tc.draw(
+                gs::integers::<usize>()
+                    .min_value(if interleaved { 3 } else { 1 })
+                    .max_value(12),
+            ),
             unit: choice(),
             host: choice(),
             message: choice(),
-            priority: [None, Some(3), Some(4), Some(5), Some(7)]
-                [tc.draw(gs::integers::<usize>().max_value(4))],
-            step_ms: [0, 1, 4_999, 5_000][tc.draw(gs::integers::<usize>().max_value(3))],
+            priority: if interleaved {
+                Some(6)
+            } else {
+                [None, Some(3), Some(4), Some(5), Some(7)]
+                    [tc.draw(gs::integers::<usize>().max_value(4))]
+            },
+            step_ms: [0, 1, 2_500, 2_501, 4_999, 5_000]
+                [tc.draw(gs::integers::<usize>().max_value(5))],
+            interleaved,
+            clock: [
+                JournalClock::Forward,
+                JournalClock::Backward,
+                JournalClock::Missing,
+            ][tc.draw(gs::integers::<usize>().max_value(2))],
         },
         5 => Action::Advance(
             [0, 1, 4_999, 5_000, 59_999, 60_000][tc.draw(gs::integers::<usize>().max_value(5))],
@@ -180,6 +205,7 @@ fn action(tc: &TestCase) -> Action {
 
 struct Model {
     events: Vec<(u64, Event)>,
+    grouping: Grouping,
     row_limit: usize,
     now: u64,
     muted: bool,
@@ -191,9 +217,10 @@ struct Model {
 }
 
 impl Model {
-    fn new(row_limit: usize) -> Self {
+    fn new(row_limit: usize, grouping: Grouping) -> Self {
         Self {
             events: Vec::new(),
+            grouping,
             row_limit,
             now: 0,
             muted: false,
@@ -205,13 +232,54 @@ impl Model {
         }
     }
 
-    fn rows(&self) -> Vec<&[(u64, Event)]> {
-        self.events
-            .chunk_by(|(_, a), (_, b)| {
-                (&a.host, &a.unit, a.priority, &a.message)
-                    == (&b.host, &b.unit, b.priority, &b.message)
-            })
-            .collect()
+    fn rows(&self) -> Vec<Vec<usize>> {
+        // Replay the whole input. Trace each event back to the last raw event
+        // from its source, then follow that event's row assignment.
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        let mut assignments: Vec<usize> = Vec::new();
+        for (index, (at, event)) in self.events.iter().enumerate() {
+            let previous = self.events[..index]
+                .iter()
+                .rposition(|(_, e)| e.host == event.host && e.unit == event.unit);
+            let candidate = previous.and_then(|previous| {
+                let last = &self.events[previous].1;
+                let row = assignments[previous];
+                if row < rows.len().saturating_sub(self.row_limit)
+                    || last.priority != event.priority
+                    || last.message != event.message
+                {
+                    return None;
+                }
+                if previous + 1 == index {
+                    return Some(row);
+                }
+                let first = rows[row][0];
+                let (start, first_event) = &self.events[first];
+                let journal_span_ok = first_event
+                    .realtime_us
+                    .zip(event.realtime_us)
+                    .is_none_or(|(a, b)| a <= b && b - a <= 5_000_000);
+                let journal_order_ok = last
+                    .realtime_us
+                    .zip(event.realtime_us)
+                    .is_none_or(|(a, b)| a <= b);
+                (self.grouping == Grouping::Burst
+                    && matches!(event.priority, Some(5..=7))
+                    && event.unit != "(unknown)"
+                    && index - first <= 8
+                    && at - start <= 5_000
+                    && journal_span_ok
+                    && journal_order_ok)
+                    .then_some(row)
+            });
+            let row = candidate.unwrap_or_else(|| {
+                rows.push(Vec::new());
+                rows.len() - 1
+            });
+            rows[row].push(index);
+            assignments.push(row);
+        }
+        rows
     }
 
     fn visible(&self, event: &Event) -> bool {
@@ -234,11 +302,13 @@ impl Model {
         .any(|field| field.to_lowercase().contains(&self.query.to_lowercase()))
     }
 
-    fn visible_rows(&self) -> Vec<&[(u64, Event)]> {
-        let mut rows = self.rows();
-        rows.drain(..rows.len().saturating_sub(self.row_limit));
-        rows.retain(|row| self.visible(&row[0].1));
-        rows
+    fn visible_ids(&self, rows: &[Vec<usize>]) -> Vec<u64> {
+        rows[rows.len().saturating_sub(self.row_limit)..]
+            .iter()
+            .map(|row| row[0])
+            .filter(|index| self.visible(&self.events[*index].1))
+            .map(|index| index as u64 + 1)
+            .collect()
     }
 
     fn activity(&self) -> Vec<UnitActivity> {
@@ -273,12 +343,23 @@ impl Model {
                 message,
                 priority,
                 step_ms,
+                interleaved,
+                clock,
             } => {
-                for _ in 0..count {
+                for position in 0..count {
+                    let unit = if interleaved {
+                        (unit + position % 2) % UNITS.len()
+                    } else {
+                        unit
+                    };
                     self.now += step_ms;
                     let id = self.events.len() as u64 + 1;
                     let event = Event {
-                        realtime_us: Some(id * 1000),
+                        realtime_us: match clock {
+                            JournalClock::Forward => Some(self.now * 1_000),
+                            JournalClock::Backward => Some(u64::MAX - id * 1_000),
+                            JournalClock::Missing => None,
+                        },
                         cursor: Some(id.to_string()),
                         priority,
                         host: HOSTS[host].map(str::to_owned),
@@ -321,7 +402,7 @@ impl Model {
             }
             Action::Pause(value) => {
                 if value && !self.paused {
-                    self.anchor = self.visible_rows().last().map(|row| event_id(&row[0].1));
+                    self.anchor = self.visible_ids(&self.rows()).last().copied();
                 } else if !value {
                     self.anchor = None;
                 }
@@ -342,9 +423,14 @@ impl Model {
         assert_eq!(actual.rows().len(), retained.len(), "after {after:?}");
         for (actual, expected) in actual.rows().iter().zip(retained) {
             assert_eq!(actual.count, expected.len() as u64, "after {after:?}");
-            assert_eq!(*actual.first, expected[0].1);
-            assert_eq!(*actual.last, expected.last().unwrap().1);
-            assert!(actual.recent_times().len() <= 6);
+            assert_eq!(actual.id, expected[0] as u64 + 1);
+            assert_eq!(*actual.first, self.events[expected[0]].1);
+            assert_eq!(*actual.last, self.events[*expected.last().unwrap()].1);
+            let times: Vec<_> = expected[expected.len().saturating_sub(6)..]
+                .iter()
+                .map(|&index| self.events[index].1.realtime_us)
+                .collect();
+            assert!(actual.recent_times().iter().copied().eq(times));
         }
 
         let counters = actual.counters();
@@ -358,12 +444,11 @@ impl Model {
         assert_eq!(counters.activity_dropped, 0);
         assert_eq!(actual.activity(), self.activity(), "after {after:?}");
 
-        let visible = self.visible_rows();
-        let visible_ids: Vec<_> = visible.iter().map(|group| event_id(&group[0].1)).collect();
+        let visible_ids = self.visible_ids(&rows);
         assert_eq!(
             actual
                 .visible_rows()
-                .map(|group| event_id(&group.first))
+                .map(|group| group.id)
                 .collect::<Vec<_>>(),
             visible_ids,
             "after {after:?}",
@@ -380,26 +465,25 @@ impl Model {
         };
         assert_eq!(actual.is_paused(), self.paused);
         assert_eq!(
-            actual.selected_group().map(|row| event_id(&row.first)),
+            actual.selected_group().map(|row| row.id),
             selection.copied(),
             "after {after:?}"
         );
     }
 }
 
-fn event_id(event: &Event) -> u64 {
-    event.realtime_us.unwrap() / 1000
-}
-
 #[hegel::test(test_cases = 200)]
 fn burst_and_view_actions_match_a_full_history_model(tc: TestCase) {
     let limit = tc.draw(gs::integers::<usize>().min_value(1).max_value(16));
     let actions = tc.draw(gs::vecs(action()).min_size(1).max_size(70));
-    let mut state = State::new(limit, 1024);
-    let mut model = Model::new(limit);
-    for action in &actions {
-        model.apply(action, &mut state);
-        model.compare(&state, action);
+    for grouping in [Grouping::Burst, Grouping::Adjacent] {
+        let mut state = State::new(limit, 1024);
+        state.set_grouping(grouping);
+        let mut model = Model::new(limit, grouping);
+        for action in &actions {
+            model.apply(action, &mut state);
+            model.compare(&state, action);
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::state::{Group, SPARK_BINS, State, UnitActivity};
+use crate::state::{Group, Grouping, SPARK_BINS, State, UnitActivity};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -240,32 +240,47 @@ fn render_tail(
     status: &Status<'_>,
     no_color: bool,
 ) {
+    let grouping = match state.grouping() {
+        Grouping::Burst => "bursts",
+        Grouping::Adjacent => "adjacent",
+    };
     let block = section(
-        format!("Journal · local{}", filter_status(state)),
+        format!("Journal · local · {grouping}{}", filter_status(state)),
         !status.service_focus,
         no_color,
     );
     let content = block.inner(area);
     let mut lines = Vec::new();
     if let Some(selected) = state.selected_group() {
-        lines.extend(
-            state
-                .visible_rows()
-                .rev()
-                .skip_while(|row| row.id > selected.id)
-                .take(usize::from(content.height))
-                .map(|row| {
-                    tail_line(
-                        row,
-                        row.id == selected.id && state.is_paused() && !status.service_focus,
-                        state.show_hosts(),
-                        content.width < 65,
-                        no_color,
-                        usize::from(content.width),
-                    )
-                }),
-        );
-        lines.reverse();
+        let rows: Vec<_> = state
+            .indexed_visible_rows()
+            .rev()
+            .skip_while(|(_, row)| row.id > selected.id)
+            .take(usize::from(content.height))
+            .collect();
+        let mut rows = rows.into_iter().rev().peekable();
+        let mut joins_previous = false;
+        while let Some((index, row)) = rows.next() {
+            let joins_next = state.grouping() == Grouping::Burst
+                && rows.peek().is_some_and(|(next_index, next)| {
+                    *next_index == index + 1 && next.continues_from(row)
+                });
+            let gutter = match (joins_previous, joins_next) {
+                (false, true) => "╭ ",
+                (true, true) => "│ ",
+                (true, false) => "╰ ",
+                (false, false) => "  ",
+            };
+            lines.push(tail_line(
+                row,
+                gutter,
+                row.id == selected.id && state.is_paused() && !status.service_focus,
+                state.show_hosts(),
+                no_color,
+                usize::from(content.width),
+            ));
+            joins_previous = joins_next;
+        }
     } else {
         let empty = if state.is_paused() && state.visible_rows().next().is_some() {
             "Paused before the first entry · g to jump to live"
@@ -289,18 +304,18 @@ fn render_tail(
     frame.render_widget(Paragraph::new(lines), content);
 }
 
-fn tail_line(
-    row: &Group,
+fn tail_line<'a>(
+    row: &'a Group,
+    gutter: &'static str,
     selected: bool,
     show_host: bool,
-    compact: bool,
     no_color: bool,
     width: usize,
-) -> Line<'_> {
+) -> Line<'a> {
     let event = &row.first;
     let (severity, severity_style) = severity(event.priority, no_color);
     let first = crate::local_time::format(event.realtime_us);
-    let stamp = if compact {
+    let stamp = if width < 65 {
         first[..8].to_owned()
     } else {
         first
@@ -326,10 +341,20 @@ fn tail_line(
         Cow::Borrowed("")
     };
     let available = available.saturating_sub(host.width());
-    let unit = truncate_display(&event.unit, available.saturating_sub(12).min(available / 2));
+    let short_unit = event
+        .unit
+        .strip_suffix(".service")
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(&event.unit);
+    let unit = truncate_display(short_unit, available.saturating_sub(12).min(available / 2));
     let message = truncate_display(&event.message, available.saturating_sub(unit.width()));
+    let unit_style = unit_style(&event.unit, no_color);
     let mut spans = vec![
-        Span::raw(if selected { "› " } else { "  " }),
+        if selected {
+            Span::raw("› ")
+        } else {
+            Span::styled(gutter, unit_style)
+        },
         Span::styled(stamp, Style::default().add_modifier(Modifier::DIM)),
         Span::raw(repeat),
     ];
@@ -338,7 +363,7 @@ fn tail_line(
         spans.push(Span::raw(" "));
     }
     spans.extend([
-        Span::styled(unit, unit_style(&event.unit, no_color)),
+        Span::styled(unit, unit_style),
         Span::raw(" "),
         Span::styled(severity, severity_style),
         Span::raw(" "),
@@ -793,6 +818,128 @@ mod tests {
             .chunks(usize::from(width))
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
+    }
+
+    #[test]
+    fn log_labels_shorten_only_the_trailing_service_suffix() {
+        let status = Status::default();
+        let mut state = State::default();
+        for (name, source) in [
+            ("worker@east.service", UnitField::SystemUnit),
+            ("notify.service.service", UnitField::UserUnit),
+            ("bus.service.socket", UnitField::SystemUnit),
+            ("sync.timer", UnitField::SystemUnit),
+            ("agent.service", UnitField::SyslogIdentifier),
+            (".service", UnitField::Command),
+        ] {
+            let mut entry = event("target.service ready", 5, 0);
+            entry.unit = name.to_owned();
+            entry.unit_metadata = UnitMetadata::new(source, Box::new([]));
+            state.ingest(entry, 0);
+        }
+        let display = screen(80, 24, &state, &status).join("\n");
+        for expected in [
+            "worker@east",
+            "notify.service",
+            "bus.service.socket",
+            "sync.timer",
+            "agent",
+            ".service",
+        ] {
+            assert!(
+                display.contains(&format!(" {expected} NOTICE target.service ready")),
+                "{display}"
+            );
+        }
+        state.set_search("worker@east.service");
+        let display = screen(80, 24, &state, &status).join("\n");
+        assert!(
+            display.contains(" worker@east NOTICE target.service ready"),
+            "{display}"
+        );
+        assert!(!display.contains(" agent NOTICE"), "{display}");
+        state.toggle_expanded();
+        let display = screen(80, 24, &state, &status).join("\n");
+        assert!(
+            display.contains("_SYSTEMD_UNIT=worker@east.service"),
+            "{display}"
+        );
+        let services = Status {
+            service_focus: true,
+            ..Default::default()
+        };
+        let list = screen(80, 24, &state, &services);
+        assert!(
+            list.iter()
+                .any(|line| line.contains("worker@east.service") && line.contains("1/1/0")),
+            "{list:?}"
+        );
+    }
+
+    #[test]
+    fn burst_gutter_marks_routine_runs_and_stops_at_hidden_boundaries() {
+        let mut state = State::default();
+        for (i, message) in [
+            "task one",
+            "task two",
+            "task three",
+            "interruption",
+            "task four",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let priority = if message == "interruption" { 4 } else { 6 };
+            state.ingest(event(message, priority, i as u64), i as u64);
+        }
+        let status = Status::default();
+        let gutters = |state: &State| {
+            screen(80, 24, state, &status)
+                .into_iter()
+                .filter(|line| line.contains("noisy INFO task"))
+                .map(|row| row.chars().next().unwrap())
+                .collect::<String>()
+        };
+        assert_eq!(gutters(&state), "╭│╰ ");
+        state.set_search("task");
+        assert_eq!(gutters(&state), "╭│╰ ");
+        state.move_row(-1);
+        assert_eq!(gutters(&state), "╭│›");
+        state.jump_live();
+        state.set_grouping(Grouping::Adjacent);
+        assert_eq!(gutters(&state), "    ");
+    }
+
+    #[test]
+    fn identical_short_labels_keep_separate_unit_colors_and_gutters() {
+        let mut state = State::default();
+        let mut process = event("process report", 6, 0);
+        process.unit = "noisy".to_owned();
+        process.unit_metadata = UnitMetadata::new(UnitField::Command, Box::new([]));
+        state.ingest(process, 0);
+        state.ingest(event("service report", 6, 1), 1);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &state, &Status::default(), false);
+            })
+            .unwrap();
+        let rows = terminal.backend().buffer().content().chunks(80);
+        let mut colors = Vec::new();
+        for cells in rows {
+            let text: String = cells.iter().map(|cell| cell.symbol()).collect();
+            if let Some(label) = text.find("noisy INFO ") {
+                assert!(text.starts_with("  "), "{text}");
+                colors.push(cells[text[..label].width()].fg);
+            }
+        }
+        assert_eq!(
+            colors,
+            [
+                unit_style("noisy", false).fg.unwrap(),
+                unit_style("noisy.service", false).fg.unwrap()
+            ]
+        );
     }
 
     #[test]

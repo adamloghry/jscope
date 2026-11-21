@@ -30,6 +30,8 @@ nix run . -- --input fixtures/demo.jsonl --mute-unit indexer.service
 
 For the first 60 seconds, `indexer.service` leads with nine incoming entries, two visible, and seven suppressed. Its two warnings collapse into one row. The notice from `proxy.service` also stays visible. Press Enter to inspect the repeated warning. Press Tab to focus services and Shift+M to unmute the indexer.
 
+To see burst grouping, run `nix run . -- --input fixtures/demo.jsonl`. Four “Polling job queue” entries share one `indexer` row marked `×4/800ms`, and the interleaved proxy warning has its own row. Add `--adjacent-only` to see where the warning interrupted the polling stream.
+
 Each `--mute-unit NAME` selects an exact unit name for lower-severity muting at startup. A service mute stays in effect when you toggle global mute with `m`. The same controls work with live, file, and piped input.
 
 Replay reads the same one-object-per-line JSON as live mode, as quickly as input arrives. The activity window follows receipt time. The tail and repeat details show journal timestamps in the viewer's local time zone, using the offset in effect at the time of each event. The tail stays available after the replay finishes. For an SSH stream, run this from a local terminal.
@@ -54,9 +56,15 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | End or g | Jump to the live tail |
 | q, Esc, or Ctrl+C | Quit |
 
-For the name in the tail and activity panel, JournalScope prefers `_SYSTEMD_USER_UNIT`, followed by `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, and `_COMM`. Entries without any of these share the `(unknown)` bucket. The reader uses the first usable value for each field and escapes control characters and invalid bytes for display. Expanded details identify the journal fields that supplied the unit names. All dashboard history and mute settings live in memory for the current session.
+## Reading the journal tail
 
-Use `--no-color` for an uncolored display. Adjacent valid entries with the same host, resolved unit, priority, and message collapse into a group with an occurrence count and journal time span. A diagnostic line appears when input is malformed or oversized, history is evicted, activity is dropped, or the source reports a problem. The tail holds up to 2,000 groups, and activity holds up to 16,384 intake entries, with a separate 12 MiB text budget for each. If the activity buffer reaches a limit before entries expire, its counts reflect the retained window. Journal lines over 64 KiB are discarded before their complete contents can be buffered. Journalctl can emit a null value for large fields, which the viewer treats as unavailable.
+The tail shows `sshd.service` as `sshd` and keeps other suffixes such as `.socket` and `.timer`. The activity panel, details and unit filters use the full name. JournalScope prefers `_SYSTEMD_USER_UNIT`, followed by `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, and `_COMM`. Entries without any of these share the `(unknown)` bucket. The reader uses the first usable value for each field and escapes control characters and invalid bytes for display.
+
+Burst grouping folds exact repeats from a named unit at notice, info or debug priority even when other services write in between. A different message or priority from the same host and unit starts a new group. A repeat can bridge an interruption within five seconds and eight input positions of the first occurrence. Journal timestamps, when available, must also fall in that interval and progress forward or stay equal. The row stays at its first occurrence and shows the count and elapsed span. Press Enter to inspect the timestamps and latest cursor.
+
+Consecutive exact repeats at any priority always fold. Warnings, higher severities and unknown priorities use this consecutive-only rule. The gutter connects neighboring routine rows from the same host and unit. Pass `--adjacent-only` with either live or replay input for a timeline that groups only consecutive exact repeats.
+
+Use `--no-color` for an uncolored display. Expanded details identify the journal fields that supplied the unit names. All dashboard history and mute settings live in memory for the current session. A diagnostic line appears when input is malformed or oversized, history is evicted, activity is dropped, or the source reports a problem. The tail holds up to 2,000 groups, and activity holds up to 16,384 intake entries, with a separate 12 MiB text budget for each. If the activity buffer reaches a limit before entries expire, its counts reflect the retained window. Journal lines over 64 KiB are discarded before their complete contents can be buffered. Journalctl can emit a null value for large fields, which the viewer treats as unavailable.
 
 ## Develop and verify
 

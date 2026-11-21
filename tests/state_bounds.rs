@@ -140,3 +140,38 @@ fn repeat_boundaries_include_hidden_entries_hosts_units_levels_and_messages() {
     );
     assert!(state.show_hosts());
 }
+
+#[test]
+fn nonadjacent_merges_charge_the_new_endpoint_to_the_history_byte_budget() {
+    let mut state = State::default();
+    let payload = "p".repeat(PAYLOAD_BYTES);
+    let bursts = TEXT_BUDGET / (2 * PAYLOAD_BYTES) + 20;
+    for index in 0..bursts {
+        let message = format!("{index} {payload}");
+        let at = index * 3;
+        state.ingest(event("bulk", "host", 6, &message, at), 0);
+        state.ingest(event("watch", "host", 4, &index.to_string(), at + 1), 0);
+        state.ingest(event("bulk", "host", 6, &message, at + 2), 0);
+    }
+
+    let mut minimum_bytes = 0;
+    let mut retained = 0;
+    for row in state.rows() {
+        minimum_bytes += row.first.message.len();
+        retained += row.count;
+        if row.first.unit == "bulk" {
+            assert_eq!(row.count, 2);
+            minimum_bytes += row.last.message.len();
+        } else {
+            assert_eq!(row.count, 1);
+        }
+    }
+    assert!(minimum_bytes <= TEXT_BUDGET);
+    let counters = state.counters();
+    assert!(counters.evicted_rows > 0);
+    assert_eq!(
+        counters.evicted_rows + state.rows().len() as u64,
+        (2 * bursts) as u64
+    );
+    assert_eq!(counters.evicted_occurrences + retained, (3 * bursts) as u64);
+}

@@ -1,4 +1,4 @@
-use crate::journal::Event;
+use crate::journal::{Event, UNKNOWN_UNIT};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -6,11 +6,20 @@ use std::sync::Arc;
 pub const WINDOW_MS: u64 = 60_000;
 pub const SPARK_BINS: usize = 12;
 const BIN_MS: u64 = WINDOW_MS / SPARK_BINS as u64;
+const BURST_WINDOW_MS: u64 = 5_000;
+const BURST_DISTANCE: usize = 8;
 const MAX_ROW_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ACTIVITY_BYTES: usize = 12 * 1024 * 1024;
 const SAMPLE_LIMIT: usize = 6;
 const MAX_MUTED_UNITS: usize = 128;
 const MAX_MUTED_UNIT_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Grouping {
+    #[default]
+    Burst,
+    Adjacent,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UnitMuteLimit;
@@ -33,12 +42,40 @@ pub struct Group {
     pub count: u64,
     pub first: Arc<Event>,
     pub last: Arc<Event>,
+    last_id: u64,
+    first_at: u64,
+    last_at: u64,
     times: VecDeque<Option<u64>>,
 }
 
 impl Group {
     pub fn recent_times(&self) -> &VecDeque<Option<u64>> {
         &self.times
+    }
+
+    /// Whether this row continues a short run from the preceding journal row.
+    pub fn continues_from(&self, prior: &Self) -> bool {
+        self.id > prior.last_id
+            && routine_source(&self.first)
+            && routine_source(&prior.last)
+            && same_source(&self.first, &prior.last)
+            && self
+                .first_at
+                .checked_sub(prior.last_at)
+                .is_some_and(|gap| gap <= BURST_WINDOW_MS)
+            && within_journal_window(prior.last.realtime_us, self.first.realtime_us)
+    }
+
+    fn within_burst(&self, event: &Event, id: u64, now: u64) -> bool {
+        id - self.id <= BURST_DISTANCE as u64
+            && now - self.first_at <= BURST_WINDOW_MS
+            && routine_source(event)
+            && within_journal_window(self.first.realtime_us, event.realtime_us)
+            && self
+                .last
+                .realtime_us
+                .zip(event.realtime_us)
+                .is_none_or(|(prev, next)| next >= prev)
     }
 
     fn bytes(&self) -> usize {
@@ -50,8 +87,10 @@ impl Group {
         }
     }
 
-    fn push(&mut self, event: Arc<Event>) {
+    fn push(&mut self, event: Arc<Event>, id: u64, now: u64) {
         self.count += 1;
+        self.last_id = id;
+        self.last_at = now;
         if self.times.len() == SAMPLE_LIMIT {
             self.times.pop_front();
         }
@@ -89,6 +128,7 @@ pub struct Counters {
 #[derive(Debug)]
 pub struct State {
     rows: VecDeque<Group>,
+    grouping: Grouping,
     intake: VecDeque<Intake>,
     row_bytes: usize,
     activity_bytes: usize,
@@ -120,6 +160,7 @@ impl State {
     pub fn new(max_rows: usize, max_activity: usize) -> Self {
         Self {
             rows: VecDeque::new(),
+            grouping: Grouping::default(),
             intake: VecDeque::new(),
             row_bytes: 0,
             activity_bytes: 0,
@@ -197,17 +238,34 @@ impl State {
     }
 
     fn record_row(&mut self, event: Arc<Event>) {
-        if let Some(last) = self.rows.back_mut()
-            && same_key(&last.first, &event)
-        {
-            self.row_bytes -= last.bytes();
-            last.push(event);
-            self.row_bytes += last.bytes();
+        let id = self.counters.received;
+        // An interleaved match starts within the last eight events. Immediate repeats can
+        // extend it indefinitely, but cannot insert any newer rows between those repeats.
+        let repeat = self
+            .rows
+            .iter_mut()
+            .rev()
+            .take(BURST_DISTANCE)
+            .find(|row| same_source(&row.last, &event))
+            .filter(|row| {
+                row.last.priority == event.priority
+                    && row.last.message == event.message
+                    && (id - row.last_id == 1
+                        || (self.grouping == Grouping::Burst
+                            && row.within_burst(&event, id, self.now)))
+            });
+        if let Some(group) = repeat {
+            self.row_bytes -= group.bytes();
+            group.push(event, id, self.now);
+            self.row_bytes += group.bytes();
         } else {
             self.row_bytes += event_bytes(&event);
             let realtime_us = event.realtime_us;
             self.rows.push_back(Group {
-                id: self.counters.received,
+                id,
+                last_id: id,
+                first_at: self.now,
+                last_at: self.now,
                 count: 1,
                 first: Arc::clone(&event),
                 last: event,
@@ -229,6 +287,15 @@ impl State {
         &self.rows
     }
 
+    pub fn grouping(&self) -> Grouping {
+        self.grouping
+    }
+
+    /// Choose how future events are grouped. Existing rows retain their identities.
+    pub fn set_grouping(&mut self, grouping: Grouping) {
+        self.grouping = grouping;
+    }
+
     pub fn activity_len(&self) -> usize {
         self.intake.len()
     }
@@ -242,7 +309,14 @@ impl State {
     }
 
     pub fn visible_rows(&self) -> impl DoubleEndedIterator<Item = &Group> {
-        self.rows.iter().filter(|row| self.matches(&row.first))
+        self.indexed_visible_rows().map(|(_, group)| group)
+    }
+
+    pub(crate) fn indexed_visible_rows(&self) -> impl DoubleEndedIterator<Item = (usize, &Group)> {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| self.matches(&row.first))
     }
 
     pub fn activity(&self) -> Vec<UnitActivity> {
@@ -497,7 +571,23 @@ impl State {
 }
 
 fn same_key(a: &Event, b: &Event) -> bool {
-    a.host == b.host && a.unit == b.unit && a.priority == b.priority && a.message == b.message
+    same_source(a, b) && a.priority == b.priority && a.message == b.message
+}
+
+fn same_source(a: &Event, b: &Event) -> bool {
+    a.host == b.host && a.unit == b.unit
+}
+
+fn routine_source(event: &Event) -> bool {
+    matches!(event.priority, Some(5..=7)) && event.unit != UNKNOWN_UNIT
+}
+
+fn within_journal_window(earlier: Option<u64>, later: Option<u64>) -> bool {
+    earlier.zip(later).is_none_or(|(earlier, later)| {
+        later
+            .checked_sub(earlier)
+            .is_some_and(|gap| gap <= BURST_WINDOW_MS * 1_000)
+    })
 }
 
 fn contains(value: &str, needle: &str) -> bool {
@@ -526,6 +616,104 @@ mod tests {
             unit: unit.to_owned(),
             unit_metadata: Default::default(),
             message: message.to_owned(),
+        }
+    }
+
+    #[test]
+    fn interleaved_bursts_require_both_clocks_and_a_recent_start() {
+        let folds = |gap_ms, first_us, last_us, intervening, unit, priority| {
+            let mut state = State::default();
+            let mut first = event(unit, 6, "tick", 0);
+            first.priority = priority;
+            first.realtime_us = first_us;
+            let mut last = first.clone();
+            last.realtime_us = last_us;
+            state.ingest(first, 0);
+            // Count input positions even when the intervening warning itself collapses.
+            for _ in 0..intervening {
+                state.ingest(event("other", 4, "warning", 0), 0);
+            }
+            state.ingest(last, gap_ms);
+            state.rows()[0].count == 2
+        };
+        assert!(folds(5_000, Some(10), Some(5_000_010), 7, "api", Some(5)));
+        assert!(!folds(5_001, Some(10), Some(10), 7, "api", Some(6)));
+        assert!(!folds(1, Some(10), Some(5_000_011), 7, "api", Some(6)));
+        assert!(!folds(1, Some(10), Some(9), 1, "api", Some(6)));
+        assert!(!folds(1, Some(10), Some(10), 8, "api", Some(6)));
+        assert!(folds(1, None, Some(10), 1, "api", Some(7)));
+        assert!(folds(1, Some(10), None, 1, "api", Some(7)));
+        assert!(!folds(1, None, None, 1, UNKNOWN_UNIT, Some(6)));
+        for priority in [None, Some(0), Some(4)] {
+            assert!(!folds(1, None, None, 1, "api", priority));
+        }
+    }
+
+    #[test]
+    fn adjacent_repeats_follow_the_last_input_even_when_its_group_is_earlier() {
+        let mut state = State::default();
+        state.ingest(event("api", 6, "tick", 10), 0);
+        // Start seven different rows; the first occurrence is just within reach.
+        for unit in ["b", "c", "d", "e", "f", "g", "h"] {
+            state.ingest(event(unit, 4, "warn", 20), 1);
+        }
+        state.ingest(event("api", 6, "tick", 30), 2);
+        // The raw stream stays adjacent even beyond both clock and sequence limits.
+        for _ in 0..20 {
+            state.ingest(event("api", 6, "tick", 8_000_000), 8_000);
+        }
+        assert_eq!(state.rows()[0].count, 22);
+        assert_eq!(state.rows()[0].last.realtime_us, Some(8_000_000));
+        state.ingest(event("h", 4, "warn", 9_000_000), 9_000);
+        assert_eq!(state.rows().len(), 9);
+        assert_eq!(state.rows()[7].count, 1);
+        assert_eq!(state.rows()[8].count, 1);
+    }
+
+    #[test]
+    fn interleaved_matches_respect_each_sources_latest_message_and_timestamp() {
+        let mut state = State::default();
+        for (unit, text, time) in [
+            ("api", "tick", 10),
+            ("other", "a", 20),
+            ("api", "tick", 30),
+            ("other", "b", 40),
+            // Within range of the first occurrence but older than its latest sample.
+            ("api", "tick", 25),
+            ("api", "progress", 50),
+            ("other", "c", 60),
+            ("api", "tick", 70),
+        ] {
+            state.ingest(event(unit, 6, text, time), 0);
+        }
+        assert_eq!(
+            state
+                .rows()
+                .iter()
+                .map(|row| (row.id, row.count))
+                .collect::<Vec<_>>(),
+            [(1, 2), (2, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]
+        );
+    }
+
+    #[test]
+    fn row_continuations_require_ordered_nearby_routine_events_from_one_source() {
+        let mut state = State::default();
+        for (unit, priority, text, journal_us, intake_ms) in [
+            ("api", 6, "a", 0, 0),
+            ("api", 7, "b", 5_000_000, 5_000),
+            ("api", 6, "c", 4_000_000, 5_000),
+            ("api", 6, "d", 4_100_000, 10_001),
+            ("api", 4, "e", 4_100_005, 10_001),
+            ("api", 5, "f", 4_100_006, 10_001),
+            ("db", 5, "g", 4_100_006, 10_001),
+        ] {
+            state.ingest(event(unit, priority, text, journal_us), intake_ms);
+        }
+        let rows = state.rows();
+        assert!(rows[1].continues_from(&rows[0]));
+        for index in 2..rows.len() {
+            assert!(!rows[index].continues_from(&rows[index - 1]));
         }
     }
 

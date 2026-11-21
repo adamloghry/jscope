@@ -20,7 +20,7 @@ use crossterm::{
 use jscope::{
     journal::{Frame, sanitize},
     source::{DEFAULT_BACKLOG, JournalFilters, Source, SourceMessage},
-    state::State,
+    state::{Grouping, State},
     ui,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -73,6 +73,10 @@ struct Args {
     #[arg(long, value_name = "UNIT", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     mute_unit: Vec<String>,
 
+    /// Group only consecutive exact repeats. By default, nearby routine repeats can span other units.
+    #[arg(long)]
+    adjacent_only: bool,
+
     /// Disable terminal colors.
     #[arg(long)]
     no_color: bool,
@@ -81,6 +85,9 @@ struct Args {
 impl Args {
     fn initial_state(&self) -> io::Result<State> {
         let mut state = State::default();
+        if self.adjacent_only {
+            state.set_grouping(Grouping::Adjacent);
+        }
         for unit in &self.mute_unit {
             state
                 .set_unit_muted(&sanitize(unit), true)
@@ -441,10 +448,19 @@ mod tests {
         assert_eq!(live.user_unit, ["mail.service"]);
         assert_eq!(live.boot.as_deref(), Some("-1"));
         assert_eq!(live.priority.as_deref(), Some("warning..debug"));
+        assert_eq!(
+            live.initial_state().unwrap().grouping(),
+            super::Grouping::Burst
+        );
 
-        let current = Args::try_parse_from(["jscope", "--boot", "--no-color"]).unwrap();
+        let current =
+            Args::try_parse_from(["jscope", "--boot", "--no-color", "--adjacent-only"]).unwrap();
         assert_eq!(current.boot.as_deref(), Some("0"));
         assert!(current.no_color);
+        assert_eq!(
+            current.initial_state().unwrap().grouping(),
+            super::Grouping::Adjacent
+        );
 
         let stdin = Args::try_parse_from(["jscope", "--input", "-"]).unwrap();
         assert_eq!(stdin.input.unwrap().to_str(), Some("-"));
