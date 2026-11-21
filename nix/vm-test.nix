@@ -5,11 +5,15 @@ pkgs.testers.runNixOSTest {
   requiredFeatures.kvm = false;
   qemu.forceAccel = false;
 
-  nodes.machine = { pkgs, ... }: {
+  nodes.machine = { config, lib, pkgs, ... }: {
     imports = [ ./generation-markers.nix ];
     programs.jscope.generationMarkers.enable = true;
     specialisation.marker-test.configuration.environment.etc."jscope-specialisation".text = "test";
-    environment.systemPackages = [ binary pkgs.python3 ];
+    # A parent closure already contains every specialisation. Keep hello exclusively
+    # in the parent's own profile so switching to the child really removes it.
+    environment.systemPackages = [ binary pkgs.python3 ]
+      ++ lib.optional (config.specialisation != { }) pkgs.hello;
+    nix.enable = true;
     services.journald.storage = "persistent";
 
     users.users.observer = {
@@ -93,6 +97,12 @@ pkgs.testers.runNixOSTest {
     assert [(m.get("JSCOPE_PREVIOUS_SYSTEM"), m["JSCOPE_CURRENT_SYSTEM"]) for m in markers()] == [
         (None, base), (base, special), (special, base)
     ]
+    machine.succeed(
+        "runuser -u observer -- "
+        "${pkgs.python3.withPackages (p: [ p.pyte ])}/bin/python ${./vm-diff-probe.py} "
+        "${../tests/terminal.py} ${binary}/bin/jscope "
+        f"{base} {special} ${pkgs.hello.version}"
+    )
     send_target("PRIOR_BOOT")
     machine.shutdown()
 

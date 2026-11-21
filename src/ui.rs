@@ -96,6 +96,41 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     })
 }
 
+pub fn render_closure_diff(
+    frame: &mut Frame<'_>,
+    state: &State,
+    status: &Status<'_>,
+    lines: &[String],
+    scroll: usize,
+    no_color: bool,
+) -> usize {
+    let [header, body, keys] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    render_header(
+        frame,
+        header,
+        state,
+        status,
+        &state.sidebar_activity(),
+        no_color,
+    );
+    frame.render_widget(
+        Line::raw("↑↓ PgUp/PgDn scroll · Esc back · g live · q quit"),
+        keys,
+    );
+    render_scrollable_fields(
+        frame,
+        body,
+        section("NixOS · closure changes".into(), true, no_color),
+        lines,
+        scroll,
+    )
+}
+
 fn render_header(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1115,6 +1150,12 @@ fn render_footer(
         if status.service_focus {
             keys.extend([("Enter", "spike"), ("p", "pin"), ("s", "solo")]);
         } else {
+            if state
+                .selected_group()
+                .is_some_and(|row| row.first.generation().is_some())
+            {
+                keys.push(("d", "packages"));
+            }
             keys.extend([("↵", "view"), ("[]", "spikes"), ("c", "context")]);
             if state
                 .rows()

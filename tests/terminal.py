@@ -381,6 +381,32 @@ def test_generation_markers(binary, fixture):
         wait_for("missed its health check", absent=("outside filters",))
 
 
+def test_closure_diff(binary):
+    # Use real, present store paths and a deterministic substitute for the optional nix CLI.
+    old = str(Path(binary).resolve().parents[1])
+    new = str(Path(sys.executable).resolve().parents[1])
+    with TemporaryDirectory() as directory:
+        nix = Path(directory) / "nix"
+        args = ["--offline", "--store", "auto", "--extra-experimental-features", "nix-command", "store", "diff-closures", old, new]
+        nix.write_text(f"#!{sys.executable}\nimport sys\nassert sys.argv[1:] == {args!r}\nprint('worker: 1.0 -> 1.1')\n")
+        nix.chmod(0o755)
+        with terminal([binary, "--input", "-"], columns=90, lines=24, piped=True, env={"PATH":directory}) as (scope, keys, wait):
+            marker = {"SYSLOG_IDENTIFIER":"jscope-activation","JSCOPE_MARKER":"nixos-activation-v1",
+                      "JSCOPE_PREVIOUS_SYSTEM":old, "JSCOPE_CURRENT_SYSTEM":new, "MESSAGE":"System activation", "PRIORITY":"5"}
+            scope.stdin.write((json.dumps(marker) + "\n").encode())
+            scope.stdin.flush()
+            wait("1/min")
+            keys(b"Gd")
+            wait("closure changes", "worker: 1.0 -> 1.1")
+            scope.stdin.write(journal_record("api.service", 4, "after the switch").encode())
+            scope.stdin.flush()
+            wait("2/min", "worker: 1.0 -> 1.1")
+            keys(b"\x1b")
+            wait("Journal", absent=("closure changes",))
+            keys(b"g")
+            wait("after the switch")
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
@@ -392,3 +418,4 @@ if __name__ == "__main__":
     test_cross_service_context(sys.argv[1], sys.argv[2])
     test_message_patterns(sys.argv[1])
     test_generation_markers(sys.argv[1], sys.argv[3])
+    test_closure_diff(sys.argv[1])

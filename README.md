@@ -70,7 +70,7 @@ After an inspector jump, the brackets follow the service you jumped from. After 
 
 Import the flake's default NixOS module and set `programs.jscope.generationMarkers.enable = true;` to record system activations. Each boot gets one journal entry identifying the booted system closure. A live switch, test activation, or rollback to a different closure records both store paths. Equal-closure reactivation and dry activation produce no marker. Enable the option in the configurations you want to track.
 
-A **◆ NixOS** row marks the transition. Press **G** in the tail or service list to jump to the newest retained marker. Press **G** again for an earlier one. **Enter** opens its full paths and journal cursor. A filtered marker is temporarily revealed. **g** returns to live. Native journal selectors still determine which markers arrive. File and SSH replay carry the same fields.
+A **◆ NixOS** row marks the transition. Press **G** in the tail or service list to jump to the newest retained marker. Press **G** again for an earlier one. **Enter** opens its full paths and journal cursor. A filtered marker is temporarily revealed. **g** returns to live. On a selected marker, **d** opens the package changes between its two closures. Use arrow or page keys to scroll, **Esc** to return to the marker or **g** to go live. The comparison runs on demand using local Nix. A first boot marker or a closure missing from this machine produces an explanation in the dashboard. Native journal selectors still determine which markers arrive. File and SSH replay carry the same fields.
 
 Try a boot, a switch and a rollback with `nix run . -- --input fixtures/generations.jsonl`.
 
@@ -115,6 +115,7 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | 1 / 2 / 3 in the inspector | Follow that ranked message in the selected service and interval |
 | ← / → while following a message | Move to the previous or next exact occurrence. Enter jumps to the tail, Esc goes back to the graph |
 | c | Open a ±2-second cross-service context window from the tail or occurrence browser. Esc returns |
+| d | Compare the local closures of the selected activation marker |
 | G | Jump to the newest retained NixOS activation, then step backwards through earlier activations |
 | p | Pin or unpin the selected service for comparison (up to two) |
 | ← / → | Select an older or newer five-second interval in the inspector |

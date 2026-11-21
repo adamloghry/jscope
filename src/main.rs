@@ -1,3 +1,5 @@
+mod closure_diff;
+
 use std::{
     io::{self, IsTerminal},
     path::{Path, PathBuf},
@@ -178,6 +180,7 @@ impl InputStatus {
 
 #[derive(Default)]
 struct Controls {
+    closure_diff: Option<closure_diff::ClosureDiff>,
     detail_scroll_limit: usize,
     service_focus: bool,
     search: String,
@@ -220,6 +223,29 @@ impl Controls {
             }
             return true;
         }
+        if let Some(diff) = &mut self.closure_diff {
+            let delta: isize = match key.code {
+                KeyCode::Up => -1,
+                KeyCode::Down => 1,
+                KeyCode::PageUp => -8,
+                KeyCode::PageDown => 8,
+                KeyCode::Esc | KeyCode::Char('d') => {
+                    self.closure_diff = None;
+                    return true;
+                }
+                KeyCode::Char('g') | KeyCode::End => {
+                    self.closure_diff = None;
+                    state.jump_live();
+                    return true;
+                }
+                _ => return true,
+            };
+            diff.scroll = diff
+                .scroll
+                .saturating_add_signed(delta)
+                .min(self.detail_scroll_limit);
+            return true;
+        }
         if state.spike().is_some() {
             self.spike_key(key.code, state);
             return true;
@@ -249,6 +275,24 @@ impl Controls {
                 Ok(()) => self.service_focus = false,
                 Err(reason) => self.notice = Some(reason.to_string()),
             },
+            KeyCode::Char('d') if !self.service_focus => {
+                let marker = state
+                    .spike_hit()
+                    .or_else(|| state.selected_group().map(|row| row.first.as_ref()))
+                    .and_then(|e| e.generation());
+                match marker
+                    .ok_or_else(|| {
+                        io::Error::other("Select a NixOS activation marker to compare closures")
+                    })
+                    .and_then(closure_diff::ClosureDiff::start)
+                {
+                    Ok(diff) => {
+                        state.set_paused(true);
+                        self.closure_diff = Some(diff);
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
             KeyCode::Char('p') if self.service_focus => {
                 self.notice = state.toggle_pin().err().map(String::from);
             }
@@ -402,6 +446,9 @@ fn run(args: Args) -> io::Result<ExitCode> {
             _ => {}
         }
 
+        if let Some(diff) = &mut controls.closure_diff {
+            dirty |= diff.poll();
+        }
         let redraw_after = if dirty { POLL_INTERVAL } else { IDLE_REDRAW };
         if last_draw.is_none_or(|last| last.elapsed() >= redraw_after) {
             let status = ui::Status {
@@ -415,7 +462,17 @@ fn run(args: Args) -> io::Result<ExitCode> {
             };
             let mut limit = 0;
             terminal.draw(|frame| {
-                limit = ui::render(frame, &state, &status, args.no_color);
+                limit = match &controls.closure_diff {
+                    Some(diff) => ui::render_closure_diff(
+                        frame,
+                        &state,
+                        &status,
+                        &diff.lines,
+                        diff.scroll,
+                        args.no_color,
+                    ),
+                    None => ui::render(frame, &state, &status, args.no_color),
+                };
             })?;
             controls.detail_scroll_limit = limit;
             last_draw = Some(Instant::now());
