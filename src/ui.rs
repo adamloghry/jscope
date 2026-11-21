@@ -1,12 +1,13 @@
 use crate::journal::Event;
 use crate::state::{
-    BinSeverity, Group, Grouping, SPARK_BINS, SpikeSnapshot, State, UnitActivity, WINDOW_MS,
+    BinSeverity, Group, Grouping, SPARK_BINS, SpikeBin, SpikeSnapshot, State, UnitActivity,
+    WINDOW_MS,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -26,7 +27,7 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     let wide = area.width >= 104;
     let expanded = state
         .expanded_group()
-        .filter(|_| wide || !status.service_focus);
+        .filter(|_| state.spike().is_none() && (wide || !status.service_focus));
     let detail_height = expanded.map_or(0, |_| (area.height / 2).clamp(4, 12));
     let summaries = state.sidebar_activity();
     let diagnostics = diagnostic_line(state, status);
@@ -438,6 +439,9 @@ fn truncate_display(text: &str, width: usize) -> Cow<'_, str> {
 
 fn unit_tags(state: &State, unit: &str) -> String {
     let mut tags = String::new();
+    if state.is_pinned(unit) {
+        tags.push_str(" [pin]");
+    }
     if state.solo() == Some(unit) {
         tags.push_str(" [solo]");
     }
@@ -546,39 +550,70 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
     let block = section("Spike · 60s snapshot".into(), true, no_color);
     let content = block.inner(area);
     frame.render_widget(block, area);
-    let counts = spike.bins.each_ref().map(|bin| bin.count);
-    let severities = spike.bins.each_ref().map(|bin| bin.severity);
-    let unit = unit_style(&spike.unit, no_color);
     let accent = colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD);
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut chart = Vec::new();
-    for (index, bar) in
-        sparkline(&counts, &severities, SPARK_BINS, None, unit, no_color).enumerate()
-    {
-        let marker = if index == spike.selected {
-            "["
-        } else if index == spike.selected + 1 {
-            "]"
-        } else {
-            " "
-        };
-        chart.push(Span::styled(marker, accent));
-        chart.push(bar);
+    let width = usize::from(content.width);
+    let mut lanes = vec![(spike.unit.as_str(), &spike.bins, true)];
+    if let Some(peer) = &spike.peer {
+        lanes.push((peer.unit.as_str(), &peer.bins, false));
+        if spike.peer_first {
+            lanes.swap(0, 1);
+        }
     }
-    if spike.selected + 1 == SPARK_BINS {
-        chart.push(Span::styled("]", accent));
+    let paired = lanes.len() == 2;
+    let peak = lanes
+        .iter()
+        .flat_map(|(_, bins, _)| bins.iter().map(|bin| bin.count))
+        .max()
+        .unwrap_or(0);
+    let show_times = paired && width >= 28;
+    let name_width = lanes
+        .iter()
+        .map(|(name, _, _)| name.width())
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(if show_times { 16 } else { 2 }));
+    let mut lines = Vec::new();
+    for (name, bins, active) in lanes {
+        let style = unit_style(name, no_color);
+        let bin = &bins[spike.selected];
+        if paired {
+            let name = truncate_display(name, name_width);
+            let pad = name_width - name.width() + 2;
+            let mut label = vec![
+                Span::styled(if active { "› " } else { "  " }, accent),
+                Span::styled(name, style),
+            ];
+            if show_times && let Some(event) = bin.event() {
+                label.push(Span::raw(" ".repeat(pad)));
+                label.push(Span::styled(
+                    crate::local_time::format(event.realtime_us),
+                    dim,
+                ));
+            }
+            lines.push(Line::from(label));
+        } else {
+            lines.push(Line::styled(truncate_display(name, width), style));
+        }
+        let mut chart = spike_chart(bins, spike.selected, peak, style, no_color, paired);
+        if paired {
+            let count = format!("  {} in", bin.count);
+            let count = if chart.width() + count.width() <= width {
+                count
+            } else {
+                format!("  {}", compact_count(bin.count))
+            };
+            chart.push_span(Span::styled(count, dim));
+        }
+        lines.push(chart);
     }
     let bin = &spike.bins[spike.selected];
     let seconds = WINDOW_MS / SPARK_BINS as u64 / 1_000;
     let age = (SPARK_BINS - 1 - spike.selected) as u64 * seconds;
-    let mut lines = vec![
-        Line::styled(
-            truncate_display(&spike.unit, usize::from(content.width)),
-            unit,
-        ),
-        Line::from(chart),
-        Line::styled(format!("{age}–{}s before capture", age + seconds), dim),
-    ];
+    lines.push(Line::styled(
+        format!("{age}–{}s before capture", age + seconds),
+        dim,
+    ));
     if let Some(event) = bin.event() {
         let target = match bin.severity {
             BinSeverity::Normal => "first arrival",
@@ -593,11 +628,60 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
             Span::raw(" "),
             Span::styled(label, severity_style),
         ]));
-        lines.push(Line::raw(&event.message));
+        lines.push(Line::raw(truncate_display(&event.message, width)));
+        lines.push(Line::styled("Top messages", accent));
+        for driver in &bin.drivers {
+            let share = format!("{}/{} · ", driver.count, bin.count);
+            let message = truncate_display(&driver.message, width.saturating_sub(share.width()));
+            lines.push(Line::from(vec![
+                Span::styled(share, accent),
+                Span::raw(message),
+            ]));
+        }
     } else {
         lines.push(Line::from("0 entries · empty interval"));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+    frame.render_widget(Paragraph::new(lines), content);
+}
+
+fn spike_chart(
+    bins: &[SpikeBin; SPARK_BINS],
+    selected: usize,
+    peak: u64,
+    style: Style,
+    no_color: bool,
+    paired: bool,
+) -> Line<'static> {
+    let cursor = colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD);
+    let mut chart = Vec::new();
+    for (index, bin) in bins.iter().enumerate() {
+        let height = spark_height(bin.count, peak);
+        if paired && no_color {
+            // Show both severity and volume when comparing bars without color.
+            if index == selected {
+                chart.push(Span::styled("[", cursor));
+            }
+            chart.push(spark_bar(" ", bin.severity, style, true));
+            chart.push(Span::styled(height, style));
+            if index == selected {
+                chart.push(Span::styled("]", cursor));
+            }
+        } else {
+            let marker = if index == selected {
+                "["
+            } else if index == selected + 1 {
+                "]"
+            } else {
+                " "
+            };
+            chart.push(Span::styled(marker, cursor));
+            chart.push(spark_bar(height, bin.severity, style, no_color));
+        }
+    }
+    if selected + 1 == SPARK_BINS && !(paired && no_color) {
+        chart.push(Span::styled("]", cursor));
+    }
+    Line::from(chart)
 }
 
 fn activity_spans<'a>(
@@ -791,39 +875,46 @@ fn render_footer(
         return;
     }
     let mut spans = Vec::new();
-    let pane = if status.service_focus {
-        "journal"
-    } else {
-        "services"
-    };
     let separator = if area.width >= 88 { "  " } else { " " };
-    let keys: &[(&str, &str)] = if state.spike().is_some() {
-        &[
+    let mut keys = Vec::new();
+    if let Some(spike) = state.spike() {
+        if spike.peer.is_some() {
+            keys.push(("↑↓", "service"));
+        }
+        keys.extend([
             ("←→", "interval"),
             ("Enter", "jump"),
             ("Esc", "back"),
             ("g", "live"),
             ("q", "quit"),
-        ]
+        ]);
     } else {
-        &[
+        keys.extend([
             ("q", "quit"),
-            ("Tab", pane),
+            (
+                "Tab",
+                if status.service_focus {
+                    "journal"
+                } else {
+                    "services"
+                },
+            ),
             ("↑↓", "move"),
-            if status.service_focus {
-                ("Enter", "spike")
-            } else {
-                ("↵", "view")
-            },
-            ("s", "solo"),
-            ("m/M", "mute"),
-            ("/", "find"),
-            ("Space", "pause"),
+        ]);
+        if status.service_focus {
+            keys.extend([("Enter", "spike"), ("p", "pin"), ("s", "solo")]);
+        } else {
+            keys.extend([("↵", "view"), ("[]", "spikes")]);
+        }
+        keys.extend([
             ("g", "live"),
-        ]
-    };
+            ("/", "find"),
+            ("m/M", "mute"),
+            ("Space", if state.is_paused() { "resume" } else { "pause" }),
+        ]);
+    }
     let mut remaining = usize::from(area.width);
-    for &(key, action) in keys {
+    for (key, action) in keys {
         let width = key.width() + 1 + action.width();
         if width > remaining {
             break;
@@ -906,25 +997,26 @@ fn sparkline<'a>(
     normal: Style,
     no_color: bool,
 ) -> impl Iterator<Item = Span<'a>> + 'a {
-    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
     let counts = buckets(bins, bars).map(|bin| bin.iter().sum::<u64>());
     let max = peak.unwrap_or_else(|| counts.clone().max().unwrap_or(0));
     counts
         .zip(buckets(severity, bars))
         .map(move |(count, severities)| {
-            let height = if count == 0 {
-                "·"
-            } else {
-                let bar = (count as u128 * 7 / max as u128) as usize;
-                LEVELS[bar]
-            };
             spark_bar(
-                height,
+                spark_height(count, max),
                 severities.iter().copied().max().unwrap_or_default(),
                 normal,
                 no_color,
             )
         })
+}
+
+fn spark_height(count: u64, peak: u64) -> &'static str {
+    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    if count == 0 {
+        return "·";
+    }
+    LEVELS[(u128::from(count) * 7 / u128::from(peak)) as usize]
 }
 
 fn severity(priority: Option<u8>, no_color: bool) -> (&'static str, Style) {
@@ -1081,6 +1173,96 @@ mod tests {
             view.contains("[·]") && view.contains("0 entries · empty interval"),
             "{view}"
         );
+    }
+
+    #[test]
+    fn paired_charts_keep_one_scale_cursor_and_lane_order_when_switching() {
+        let mut state = State::default();
+        let target_us = 1_740_000_000_000_000;
+        let long_warning = "queue lag ".repeat(100);
+        state.ingest(event(&long_warning, 4, target_us), 40_000);
+        for message in ["retry", "retry", "retry", "retry", "retry", "wait", "wait"] {
+            state.ingest(event(message, 6, target_us), 40_000);
+        }
+        let mut peer = event("socket failed", 3, target_us + 3_000_000);
+        peer.unit = "db.service".into();
+        state.ingest(peer, 40_000);
+        state.set_search("hide all rows");
+        let status = Status {
+            service_focus: true,
+            ..Default::default()
+        };
+        state.toggle_pin().unwrap();
+        let services = screen(80, 24, &state, &status).join("\n");
+        assert!(
+            services.contains("noisy.service [pin]") && services.contains("p pin"),
+            "{services}"
+        );
+        state.move_unit(1);
+        state.toggle_pin().unwrap();
+        state.move_unit(-1);
+        assert!(state.begin_spike());
+        for width in [80, 104] {
+            for no_color in [true, false] {
+                let buffer = render_buffer(width, 24, &state, &status, no_color);
+                let rows = lines(&buffer);
+                let view = rows.join("\n");
+                assert!(
+                    view.contains("Top messages") && view.contains("↑↓ service"),
+                    "{view}"
+                );
+                assert!(
+                    view.contains("5/8 · retry") && view.contains("2/8 · wait"),
+                    "{view}"
+                );
+                assert!(
+                    view.contains("1/8 · queue lag") && view.contains('…'),
+                    "{view}"
+                );
+                let a = rows
+                    .iter()
+                    .position(|line| line.contains("› noisy.service"))
+                    .unwrap();
+                let b = rows
+                    .iter()
+                    .position(|line| line.contains("  db.service"))
+                    .unwrap();
+                let time_a = crate::local_time::format(Some(target_us));
+                let time_b = crate::local_time::format(Some(target_us + 3_000_000));
+                let clock_x = |line: &str, stamp: &str| line.split_once(stamp).unwrap().0.width();
+                assert_eq!(clock_x(&rows[a], &time_a), clock_x(&rows[b], &time_b));
+                assert!(a < b);
+                let (bar_a, bar_b) = if no_color {
+                    ("[!█]", "[×▁]")
+                } else {
+                    ("[█]", "[▁]")
+                };
+                let x = rows[a + 1].split_once(bar_a).unwrap().0.width() as u16;
+                assert_eq!(x, rows[b + 1].split_once(bar_b).unwrap().0.width() as u16);
+                assert!(rows[a + 1].contains("8 in") && rows[b + 1].contains("1 in"));
+                if no_color {
+                    assert!(buffer.content().iter().all(|cell| cell.fg == Color::Reset));
+                } else {
+                    assert_eq!(buffer[(x + 1, a as u16 + 1)].fg, Color::LightYellow);
+                    assert_eq!(buffer[(x + 1, b as u16 + 1)].fg, Color::LightRed);
+                }
+                state.switch_spike_unit();
+                let swapped = lines(&render_buffer(width, 24, &state, &status, no_color));
+                assert!(
+                    swapped[a].contains("  noisy.service") && swapped[b].contains("› db.service")
+                );
+                assert_eq!(
+                    (&rows[a + 1], &rows[b + 1]),
+                    (&swapped[a + 1], &swapped[b + 1])
+                );
+                assert!(
+                    swapped
+                        .iter()
+                        .any(|line| line.contains("1/1 · socket failed"))
+                );
+                state.switch_spike_unit();
+            }
+        }
     }
 
     #[test]

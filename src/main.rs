@@ -227,6 +227,13 @@ impl Controls {
                     (!state.begin_spike()).then(|| "No service has activity to inspect".into());
             }
             KeyCode::Enter => state.toggle_expanded(),
+            KeyCode::Char('p') if self.service_focus => {
+                self.notice = state.toggle_pin().err().map(String::from);
+            }
+            KeyCode::Char(key @ ('[' | ']')) if !self.service_focus => {
+                let direction = if key == '[' { -1 } else { 1 };
+                self.notice = state.hop_spike(direction).err().map(String::from);
+            }
             KeyCode::Char('s') => state.toggle_solo(),
             KeyCode::Char('m') => state.toggle_mute(),
             KeyCode::Char('M') => {
@@ -244,6 +251,7 @@ impl Controls {
         match code {
             KeyCode::Left => state.move_spike(-1),
             KeyCode::Right => state.move_spike(1),
+            KeyCode::Up | KeyCode::Down => state.switch_spike_unit(),
             KeyCode::Enter => match state.jump_to_spike() {
                 Ok(()) => self.service_focus = false,
                 Err(reason) => self.notice = Some(reason.to_string()),

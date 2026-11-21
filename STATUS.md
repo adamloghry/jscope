@@ -31,6 +31,10 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-25 | UI owner, graph inspector and landing view | verified | JS-21, JS-24 | None |
 | JS-26 | Test owner, model and replay tests | verified | JS-24 | None |
 | JS-27 | Integrator, controls, PTY tests, docs and check-in | verified | JS-24–26 | None on x86_64-linux |
+| JS-28 | State owner, src/state.rs | verified | JS-24 | All 22 state tests passed, including manual-pause and eviction boundaries |
+| JS-29 | UI owner, src/ui.rs | verified | JS-28 interface | All 14 UI tests passed, including color and monochrome comparisons at two widths |
+| JS-30 | Test owner, tests/properties.rs and tests/replay.rs | verified | JS-28 interface | Five Hegel properties and eleven replay tests passed |
+| JS-31 | Integrator, controls, packaged terminal tests, docs and check-in | verified | JS-28–30 | None on x86_64-linux |
 
 ## Shared contract
 
@@ -42,11 +46,13 @@ The default burst grouping also folds exact routine repeats across other sources
 
 Graph bins keep the worst incoming severity. The rising arrow compares five seconds of intake to up to 60 preceding seconds within the existing activity memory budget. It becomes eligible after 15 seconds of observation, requires at least three arrivals and a twofold rate increase, and waits for complete comparison history after a capacity loss. The extra five seconds of retention are used only for that comparison.
 
-Inspecting a service captures twelve five-second intake bins and at most one representative event per bin. A jump anchors the paused tail at the earliest occurrence of the displayed severity class. A filtered hit gets a temporary one-row reveal. A target evicted from tail history reports eviction, even if a later entry has identical text.
+The spike inspector captures twelve five-second intake bins per service, for up to two services on the same clock. Each bin keeps one representative event and up to three ranked message texts. A jump anchors the paused tail at the earliest occurrence of the displayed severity class. A filtered hit gets a temporary one-row reveal. An inspector target evicted from tail history reports eviction, even if a later entry has identical text. Tail hopping retains up to twelve marked occurrences, skipping evicted targets and reporting when all remaining candidates have gone.
 
 Replay has no control records or timing directives. Tests advance the state clock independently of journal timestamps. In the demo, `indexer.service` leads the first 60 seconds with 9 incoming, 2 visible, and 7 suppressed occurrences. Its paired warnings appear as one group.
 
 ## Recent decisions
+
+- Spike breakdowns count exact message text in retained incoming occurrences, before display filters. The inspector keeps the top three per five-second interval. Pinned services share a capture clock and graph scale. Bracket keys traverse marked warning/error intervals from the tail.
 
 - Use a 200-entry default live backlog and forward unit, boot, and priority selectors to journalctl. File and stdin replay use the same parser and state.
 - Build Hegel's matching 0.51.6 native engine from locked crates inside the Nix sandbox. The pinned 0.52.7 frontend loads it via `HEGEL_C_LIB_DIR`.
@@ -54,10 +60,16 @@ Replay has no control records or timing directives. Tests advance the state cloc
 
 ## Verification evidence
 
-- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 57 Rust tests including four Hegel properties, six replay tests, four retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
+- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 68 Rust tests including five Hegel properties, eleven replay tests, four retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
 - `nix build .#vm-test --no-link -L` passed on x86_64-linux in a disposable NixOS VM. It verified real journalctl follow, matching unit and priority filters, exclusion of archived records from a prior guest boot, zero and nonzero backlogs, SIGTERM shutdown, child reaping, and restored terminal settings. All logs used for the test were synthetic guest records.
 - The exact README replay command passed in an 80×24 pseudo-terminal. File and piped replay also passed direct PTY smoke tests, including details, unmute, clean quit, and terminal restoration with the pipe still open. `nix run . -- --help` verified the default app entry point.
 - `nix flake check --all-systems --no-build` evaluated package, app, dev shell, standard checks, and VM check for x86_64-linux and aarch64-linux. The environment exposes x86_64 builders only, so aarch64-linux build and runtime tests remain open.
+
+## Spike investigation verification
+
+- At both 80×24 and 104×24, the packaged README replay showed the proxy warning at 08:53:20.600 and the indexer warning at 08:53:21.600 under `TZ=UTC0`. Scrubbing kept both graphs aligned. Switching to the muted indexer showed “Polling job queue” at 6/9, the warning at 2/9, and the leased item at 1/9. Enter landed on the warning with cursor `demo-09`. The walkthrough passed with one pin and the PTY regression exercised both pins.
+- The piped terminal test navigated between two filtered warnings/errors from different services, five seconds apart in receipt time and identical in journal time. It checked exact cursors, both navigation boundaries, continued intake, and restoration of the original search on return to live.
+- A 150-case Hegel property compared both lanes and forward/backward hops against individual receipts. Deterministic tests covered message ties at third place, empty and quiet bins, pin limits, tail and activity eviction, a pause before the first receipt, and an inspector that outlives its live activity window. The two-boot x86_64-linux VM check passed after these changes. JS-06 remains open for native aarch64-linux execution.
 
 ## Jump-to-spike verification
 

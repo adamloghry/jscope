@@ -33,6 +33,22 @@ Use **←/→** to select a bar. The preview shows the first error-or-higher ent
 
 **Esc** closes the inspector and returns to the service list. If a bar is empty or its original row has been evicted, you can pick another interval.
 
+### Find what drove a spike
+
+**Top messages** ranks the three most frequent messages in the selected service and interval. A row such as `6/9 · Polling job queue` means that exact text accounted for six of the service's nine arrivals. Repeats count individually across priorities and hosts. Search, solo and mute leave these counts intact. Ties sort by message text. The breakdown stays frozen as you scrub.
+
+### Compare two services
+
+In the service list, press **p** on a service to pin it, then **Enter** on a different service to see both graphs together. Pin the second service too if you want to keep the pair, including when either goes quiet. Open either pinned service to compare them again. Press **p** on a pin to release it.
+
+Both graphs share the same capture time, five-second intervals and volume scale. Each shows the selected interval's count and the local journal time of its representative entry, so you can compare two warnings that landed in the same interval. Use **←/→** to scrub both and **↑/↓** to change which service supplies the message breakdown and jump target.
+
+### Hop between warnings and errors in the tail
+
+Press **[** from live to land on the newest five-second interval containing a warning or higher across all services. Press **[** again for the previous marked interval or **]** for the next. Each hop lands on the first incoming error or higher in that interval, or its first warning if it had no errors. The shortcuts also reveal hits hidden by a filter.
+
+After an inspector jump, the brackets follow the service you jumped from. After manually selecting a log row, they search across services, starting on either side of the interval containing the row's first arrival. Navigation holds the captured minute still while intake continues. **g** returns to live, ready for a fresh capture.
+
 ## Try a synthetic replay
 
 ```sh
@@ -43,11 +59,15 @@ For the first 60 seconds, `indexer.service` leads with nine incoming entries, tw
 
 To try **jump to spike** in this demo, press **Tab**, then **Enter** twice. The tail lands on the first “Job queue is backing up” warning. Enter opens details showing the matched cursor `demo-09` and the group's latest cursor `demo-10`.
 
+To try the **two-service comparison** from startup, press **Tab**, **p** on the indexer, **↓** to the proxy, then **Enter**. Both services had warnings in the same interval. Switch to the indexer with **↓** to see that six of its nine arrivals say “Polling job queue”, even with the indexer muted.
+
 To see the rising-rate indicator with synthetic input, send the fixture again after a quiet interval. Watch the indexer gain `↑` for five seconds when the second burst arrives. The warning bars from both bursts remain in the graph as they age.
 
 ```sh
 nix build && { cat fixtures/demo.jsonl; sleep 18; cat fixtures/demo.jsonl; } | ./result/bin/jscope --input -
 ```
+
+After the second burst arrives, press **[** twice from the tail. The first press lands in the newer warning interval, and the second takes you to the earlier burst. **]** takes you forward again.
 
 To see burst grouping, run `nix run . -- --input fixtures/demo.jsonl`. Four “Polling job queue” entries share one `indexer` row marked `×4/800ms`, and the interleaved proxy warning has its own row. Add `--adjacent-only` to see where the warning interrupted the polling stream.
 
@@ -66,7 +86,10 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | Tab | Switch focus between tail and services |
 | ↑ / ↓ | Select a group or a service |
 | Enter | In the tail, expand or close details. In services, inspect the unit's graph. In the inspector, jump to the selected interval |
+| p | Pin or unpin the selected service for comparison (up to two) |
 | ← / → | Select an older or newer five-second interval in the inspector |
+| ↑ / ↓ in a paired inspector | Switch the active service at the same interval |
+| [ / ] in the tail | Jump to an older or newer warning/error interval in the captured minute |
 | PgUp / PgDn | Scroll through expanded entry details |
 | s | Solo the selected service or clear solo |
 | m | Toggle muting below warning across all services |

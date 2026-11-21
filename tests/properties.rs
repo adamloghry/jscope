@@ -1,7 +1,7 @@
 use hegel::{TestCase, generators as gs};
 use jscope::{
     journal::{Decoder, Event, Frame, UnitField, UnitMetadata},
-    state::{BinSeverity, Grouping, State, UnitActivity},
+    state::{BinSeverity, Grouping, SpikeBin, State, UnitActivity},
 };
 use serde_json::json;
 use std::{collections::BTreeMap, io::BufReader};
@@ -647,4 +647,134 @@ fn unique_bursts_stay_bounded_without_losing_warnings_when_muted(tc: TestCase) {
     assert_eq!(state.activity()[0].visible, activity as u64);
     assert_eq!(state.counters().activity_dropped, (count - activity) as u64);
     assert_eq!(state.counters().evicted_occurrences, (count - rows) as u64);
+}
+
+// This oracle uses the original ungrouped receipts. Its two passes also distinguish
+// the first error from a later, more severe entry in the same interval.
+fn first_marked<'a>(events: &[&'a Event]) -> Option<&'a Event> {
+    events
+        .iter()
+        .copied()
+        .find(|event| matches!(event.priority, Some(0..=3)))
+        .or_else(|| {
+            events
+                .iter()
+                .copied()
+                .find(|event| event.priority == Some(4))
+        })
+}
+
+fn check_interval(bin: &SpikeBin, events: &[&Event]) {
+    assert_eq!(bin.count, events.len() as u64);
+    let first = first_marked(events).or_else(|| events.first().copied());
+    assert_eq!(bin.event(), first);
+    let mut counts = BTreeMap::new();
+    for event in events {
+        *counts.entry(event.message.as_str()).or_insert(0_u64) += 1;
+    }
+    let mut ranked: Vec<_> = counts.into_iter().collect();
+    ranked.sort_by_key(|&(message, count)| (std::cmp::Reverse(count), message));
+    ranked.truncate(3);
+    let actual: Vec<(&str, u64)> = bin
+        .drivers
+        .iter()
+        .map(|driver| (driver.message.as_ref(), driver.count))
+        .collect();
+    assert_eq!(actual, ranked);
+}
+
+#[hegel::test(test_cases = 150)]
+fn paired_drivers_and_global_hops_match_ungrouped_receipts(tc: TestCase) {
+    const CAPTURE: u64 = 65_000;
+    const TEXT: [&str; 6] = ["Retry", "retry", "open", "close", "ready", "busy"];
+    let mut state = State::default();
+    let mut receipts = Vec::new();
+    let mut receive = |state: &mut State, at, unit: &str, priority, message: &str| {
+        let event = Event {
+            realtime_us: None,
+            cursor: Some(receipts.len().to_string()),
+            unit: unit.into(),
+            host: None,
+            unit_metadata: Default::default(),
+            priority,
+            message: message.into(),
+        };
+        state.ingest(event.clone(), at);
+        receipts.push((at, event));
+    };
+    // Pin both lanes before generating the minute so that even an idle pin is covered.
+    for (index, unit) in UNITS[..2].iter().enumerate() {
+        receive(&mut state, 0, unit, Some(6), "startup");
+        state.move_unit(index as isize);
+        state.toggle_pin().unwrap();
+    }
+    let mut bursts = tc.draw(
+        gs::vecs(hegel::tuples!(
+            gs::integers::<u8>().max_value(13),
+            gs::integers::<usize>().max_value(2),
+            gs::integers::<usize>().max_value(2),
+            gs::integers::<usize>().max_value(5),
+            gs::integers::<u8>().max_value(8),
+            gs::integers::<u8>().min_value(1).max_value(5)
+        ))
+        .max_size(64),
+    );
+    bursts.sort_by_key(|&(bucket, offset, ..)| (bucket, offset));
+    for (bucket, offset, unit, message, level, count) in bursts {
+        let at = (u64::from(bucket) * 5_000 + [0, 1, 4_999][offset]).min(CAPTURE);
+        for _ in 0..count {
+            receive(
+                &mut state,
+                at,
+                UNITS[unit],
+                (level < 8).then_some(level),
+                TEXT[message],
+            );
+        }
+    }
+    state.advance(CAPTURE);
+    state.set_search("absent");
+    assert!(state.begin_spike());
+    let mut global_targets = Vec::new();
+    for index in 0..12 {
+        let ages = (11 - index as u64) * 5_000..(12 - index as u64) * 5_000;
+        let events: Vec<_> = receipts
+            .iter()
+            .filter(|(at, _)| ages.contains(&(CAPTURE - at)))
+            .map(|(_, event)| event)
+            .collect();
+        if let Some(target) = first_marked(&events) {
+            global_targets.push(target);
+        }
+        let snapshot = state.spike().unwrap();
+        let peer = snapshot.peer.as_ref().unwrap();
+        // The active lane is the pin selected before the stream changed the ranking.
+        for (unit, bin) in [
+            (UNITS[1], &snapshot.bins[index]),
+            (UNITS[0], &peer.bins[index]),
+        ] {
+            let lane: Vec<_> = events
+                .iter()
+                .copied()
+                .filter(|event| event.unit == unit)
+                .collect();
+            check_interval(bin, &lane);
+        }
+        assert_eq!(snapshot.unit, UNITS[1]);
+        assert_eq!(peer.unit, UNITS[0]);
+    }
+    state.cancel_spike();
+    assert!(state.hop_spike(1).is_err());
+    for &target in global_targets.iter().rev() {
+        state.hop_spike(-1).unwrap();
+        assert_eq!(state.spike_hit(), Some(target));
+        assert!(state.spike_hit_hidden());
+        state.advance(CAPTURE + WINDOW);
+    }
+    assert!(state.hop_spike(-1).is_err());
+    for &target in global_targets.iter().skip(1) {
+        state.hop_spike(1).unwrap();
+        assert_eq!(state.spike_hit(), Some(target));
+    }
+    assert!(state.hop_spike(1).is_err());
 }

@@ -14,6 +14,8 @@ const BURST_DISTANCE: usize = 8;
 const MAX_ROW_BYTES: usize = 12 * 1024 * 1024;
 const MAX_ACTIVITY_BYTES: usize = 12 * 1024 * 1024;
 const SAMPLE_LIMIT: usize = 6;
+const MAX_MESSAGE_DRIVERS: usize = 3;
+const MAX_PINS: usize = 2;
 const MAX_MUTED_UNITS: usize = 128;
 const MAX_MUTED_UNIT_BYTES: usize = 128 * 1024;
 
@@ -135,10 +137,25 @@ struct SpikeTarget {
     event: Arc<Event>,
 }
 
+impl SpikeTarget {
+    fn retained(&self, rows: &VecDeque<Group>) -> bool {
+        rows.binary_search_by_key(&self.group_id, |row| row.id)
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct MessageCount {
+    pub message: String,
+    pub count: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct SpikeBin {
     pub count: u64,
     pub severity: BinSeverity,
+    /// The most frequent incoming message texts, ordered by count then text.
+    pub drivers: Vec<MessageCount>,
     target: Option<SpikeTarget>,
 }
 
@@ -161,12 +178,72 @@ impl SpikeBin {
     }
 }
 
-/// One service's incoming minute, frozen at the instant inspection begins.
+#[derive(Debug)]
+pub struct SpikeLane {
+    pub unit: String,
+    pub bins: [SpikeBin; SPARK_BINS],
+}
+
+/// The inspected service and optional comparison share one frozen intake minute.
 #[derive(Debug)]
 pub struct SpikeSnapshot {
     pub unit: String,
     pub bins: [SpikeBin; SPARK_BINS],
     pub selected: usize,
+    pub peer: Option<SpikeLane>,
+    /// Preserve each graph's screen position when switching the active service.
+    pub peer_first: bool,
+}
+
+#[derive(Debug)]
+struct SpikeTrail {
+    targets: [Option<SpikeTarget>; SPARK_BINS],
+    // Live starts one past the newest bin. A row older than the window is before bin zero.
+    cursor: isize,
+}
+
+impl SpikeTrail {
+    fn from_bins(bins: &[SpikeBin; SPARK_BINS], cursor: isize) -> Self {
+        let targets = std::array::from_fn(|index| {
+            let bin = &bins[index];
+            if bin.severity == BinSeverity::Normal {
+                None
+            } else {
+                bin.target.clone()
+            }
+        });
+        Self { targets, cursor }
+    }
+
+    fn step(
+        &mut self,
+        direction: isize,
+        rows: &VecDeque<Group>,
+    ) -> Result<SpikeTarget, &'static str> {
+        if direction == 0 {
+            return Err("Choose an older or newer spike");
+        }
+        let step = direction.signum();
+        let mut next = self.cursor + step;
+        let mut evicted = false;
+        while (0..SPARK_BINS as isize).contains(&next) {
+            if let Some(target) = &self.targets[next as usize] {
+                if target.retained(rows) {
+                    self.cursor = next;
+                    return Ok(target.clone());
+                }
+                evicted = true;
+            }
+            next += step;
+        }
+        Err(if evicted {
+            "The journal rows for those spikes were evicted"
+        } else if step < 0 {
+            "No older spike in this minute"
+        } else {
+            "No newer spike in this minute"
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -208,6 +285,7 @@ pub struct State {
     multiple_hosts: bool,
     muted: bool,
     muted_units: BTreeSet<Box<str>>,
+    pins: BTreeSet<Box<str>>,
     solo: Option<String>,
     search: String,
     search_lower: String,
@@ -215,6 +293,7 @@ pub struct State {
     paused_row: Option<u64>,
     spike: Option<SpikeSnapshot>,
     spike_hit: Option<SpikeTarget>,
+    spike_trail: Option<SpikeTrail>,
     selected_unit: Option<String>,
     expanded: Option<u64>,
     detail_scroll: usize,
@@ -243,6 +322,7 @@ impl State {
             multiple_hosts: false,
             muted: false,
             muted_units: BTreeSet::new(),
+            pins: BTreeSet::new(),
             solo: None,
             search: String::new(),
             search_lower: String::new(),
@@ -250,6 +330,7 @@ impl State {
             paused_row: None,
             spike: None,
             spike_hit: None,
+            spike_trail: None,
             selected_unit: None,
             expanded: None,
             detail_scroll: 0,
@@ -420,12 +501,13 @@ impl State {
         self.summarize(true)
     }
 
-    fn summarize(&self, include_muted_units: bool) -> Vec<UnitActivity> {
+    fn summarize(&self, include_tracked_units: bool) -> Vec<UnitActivity> {
         let mut totals = BTreeMap::<&str, (UnitActivity, u64)>::new();
-        if include_muted_units {
+        if include_tracked_units {
             totals.extend(
                 self.muted_units
                     .iter()
+                    .chain(&self.pins)
                     .map(|unit| (unit.as_ref(), Default::default())),
             );
         }
@@ -494,7 +576,7 @@ impl State {
 
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
-        self.spike_hit = None;
+        self.clear_spike_landing();
     }
 
     pub fn toggle_mute(&mut self) {
@@ -508,7 +590,7 @@ impl State {
     pub fn set_unit_muted(&mut self, unit: &str, muted: bool) -> Result<(), UnitMuteLimit> {
         if !muted {
             if self.muted_units.remove(unit) {
-                self.spike_hit = None;
+                self.clear_spike_landing();
             }
             return Ok(());
         }
@@ -526,7 +608,7 @@ impl State {
             return Err(UnitMuteLimit);
         }
         self.muted_units.insert(unit.into());
-        self.spike_hit = None;
+        self.clear_spike_landing();
         Ok(())
     }
 
@@ -544,7 +626,7 @@ impl State {
 
     pub fn set_solo(&mut self, unit: Option<String>) {
         self.solo = unit;
-        self.spike_hit = None;
+        self.clear_spike_landing();
     }
 
     pub fn toggle_solo(&mut self) {
@@ -575,7 +657,7 @@ impl State {
         self.search.clear();
         self.search.push_str(query);
         self.search_lower = query.to_lowercase();
-        self.spike_hit = None;
+        self.clear_spike_landing();
     }
 
     pub fn is_paused(&self) -> bool {
@@ -590,7 +672,7 @@ impl State {
         if !paused {
             self.paused_row = None;
             self.expanded = None;
-            self.spike_hit = None;
+            self.clear_spike_landing();
         }
         self.paused = paused;
     }
@@ -627,7 +709,7 @@ impl State {
         let next = current.saturating_add_signed(delta).min(row_ids.len() - 1);
         let releasing_revealed_row =
             self.spike_hit_hidden() && self.paused_row == Some(row_ids[next]);
-        self.spike_hit = None;
+        self.clear_spike_landing();
         self.paused = true;
         self.paused_row = Some(row_ids[next]);
         if releasing_revealed_row {
@@ -643,20 +725,76 @@ impl State {
         self.selected_unit.as_deref()
     }
 
+    pub fn is_pinned(&self, unit: &str) -> bool {
+        self.pins.contains(unit)
+    }
+
+    pub fn toggle_pin(&mut self) -> Result<(), &'static str> {
+        let activity = self.sidebar_activity();
+        let unit = &self
+            .sidebar_selection(&activity)
+            .ok_or("No service to pin")?
+            .unit;
+        if self.pins.remove(unit.as_str()) {
+            return Ok(());
+        }
+        if self.pins.len() == MAX_PINS {
+            return Err("Two services are pinned. Unpin one first");
+        }
+        self.pins.insert(unit.as_str().into());
+        Ok(())
+    }
+
+    fn window_entries(&self) -> impl Iterator<Item = (usize, &Intake)> {
+        self.intake
+            .iter()
+            .filter_map(|entry| activity_bin(self.now - entry.at).map(|index| (index, entry)))
+    }
+
+    fn capture_lane(&self, unit: &str) -> SpikeLane {
+        let mut bins: [SpikeBin; SPARK_BINS] = Default::default();
+        let mut messages: [BTreeMap<&str, u64>; SPARK_BINS] = Default::default();
+        for (index, entry) in self
+            .window_entries()
+            .filter(|(_, entry)| entry.event.unit == unit)
+        {
+            bins[index].add(entry);
+            *messages[index].entry(&entry.event.message).or_default() += entry.count;
+        }
+        for (bin, counts) in bins.iter_mut().zip(messages) {
+            let mut ranked: Vec<_> = counts.into_iter().collect();
+            ranked.sort_unstable_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
+            // The tally borrows intake text. Only the winners survive capture.
+            bin.drivers = ranked
+                .into_iter()
+                .take(MAX_MESSAGE_DRIVERS)
+                .map(|(message, count)| MessageCount {
+                    message: message.to_owned(),
+                    count,
+                })
+                .collect();
+        }
+        SpikeLane {
+            unit: unit.to_owned(),
+            bins,
+        }
+    }
+
     pub fn begin_spike(&mut self) -> bool {
         let activity = self.sidebar_activity();
         let Some(selected) = self.sidebar_selection(&activity) else {
             self.spike = None;
             return false;
         };
-        let mut bins: [SpikeBin; SPARK_BINS] = Default::default();
-        for entry in &self.intake {
-            if entry.event.unit == selected.unit
-                && let Some(bin) = activity_bin(self.now - entry.at)
-            {
-                bins[bin].add(entry);
-            }
-        }
+        let SpikeLane { unit, bins } = self.capture_lane(&selected.unit);
+        let peer = if self.pins.len() < MAX_PINS || self.is_pinned(&unit) {
+            self.pins
+                .iter()
+                .find(|pin| pin.as_ref() != unit)
+                .map(|pin| self.capture_lane(pin))
+        } else {
+            None
+        };
         // Highlight the latest severe bin. With routine traffic, prefer the largest burst.
         let index = bins
             .iter()
@@ -672,9 +810,11 @@ impl State {
             .expect("a minute has at least one bin")
             .0;
         self.spike = Some(SpikeSnapshot {
-            unit: selected.unit.clone(),
+            unit,
             bins,
             selected: index,
+            peer,
+            peer_first: false,
         });
         true
     }
@@ -692,6 +832,16 @@ impl State {
         }
     }
 
+    pub fn switch_spike_unit(&mut self) {
+        if let Some(spike) = &mut self.spike
+            && let Some(peer) = &mut spike.peer
+        {
+            std::mem::swap(&mut spike.unit, &mut peer.unit);
+            std::mem::swap(&mut spike.bins, &mut peer.bins);
+            spike.peer_first = !spike.peer_first;
+        }
+    }
+
     pub fn cancel_spike(&mut self) {
         self.spike = None;
     }
@@ -705,20 +855,58 @@ impl State {
             .target
             .as_ref()
             .ok_or("This interval is empty")?;
-        if self
-            .rows
-            .binary_search_by_key(&target.group_id, |row| row.id)
-            .is_err()
-        {
+        if !target.retained(&self.rows) {
             return Err("The journal row for this spike was evicted");
         }
+        self.spike_trail = Some(SpikeTrail::from_bins(&spike.bins, spike.selected as isize));
+        self.land_spike(target.clone());
+        self.spike = None;
+        Ok(())
+    }
+
+    fn global_spike_trail(&self) -> SpikeTrail {
+        let mut bins: [SpikeBin; SPARK_BINS] = Default::default();
+        for (index, entry) in self.window_entries() {
+            bins[index].add(entry);
+        }
+        let cursor = if self.paused {
+            self.selected_group()
+                .and_then(|row| activity_bin(self.now - row.first_at))
+                .map_or(-1, |index| index as isize)
+        } else {
+            SPARK_BINS as isize
+        };
+        SpikeTrail::from_bins(&bins, cursor)
+    }
+
+    /// Step between warning/error bins in a captured minute. From the live tail,
+    /// capture all services. After an inspector jump, stay on its active service.
+    pub fn hop_spike(&mut self, direction: isize) -> Result<(), &'static str> {
+        let was_browsing = self.spike_trail.is_some();
+        let mut trail = self
+            .spike_trail
+            .take()
+            .unwrap_or_else(|| self.global_spike_trail());
+        let target = trail.step(direction, &self.rows);
+        // An unsuccessful first hop leaves a live tail ready to capture fresh arrivals.
+        if was_browsing || target.is_ok() {
+            self.spike_trail = Some(trail);
+        }
+        self.land_spike(target?);
+        Ok(())
+    }
+
+    fn land_spike(&mut self, target: SpikeTarget) {
         self.paused = true;
         self.paused_row = Some(target.group_id);
         self.expanded = None;
         self.detail_scroll = 0;
-        self.spike_hit = Some(target.clone());
-        self.spike = None;
-        Ok(())
+        self.spike_hit = Some(target);
+    }
+
+    fn clear_spike_landing(&mut self) {
+        self.spike_hit = None;
+        self.spike_trail = None;
     }
 
     /// The exact occurrence selected in the graph, even inside a repeat group.
@@ -835,6 +1023,104 @@ mod tests {
             unit_metadata: Default::default(),
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn quiet_pins_remain_selectable_and_comparisons_exclude_unpinned_third_units() {
+        let mut state = State::default();
+        assert!(state.toggle_pin().is_err());
+        for unit in ["a", "b", "c"] {
+            state.ingest(event(unit, 4, "warning", 0), 0);
+        }
+        state.toggle_pin().unwrap();
+        state.begin_spike();
+        assert!(state.spike().unwrap().peer.is_none());
+        state.cancel_spike();
+        state.move_unit(1);
+        state.begin_spike();
+        assert_eq!(state.spike().unwrap().peer.as_ref().unwrap().unit, "a");
+        state.cancel_spike();
+        state.toggle_pin().unwrap();
+        state.move_unit(1);
+        assert!(state.toggle_pin().is_err());
+        state.begin_spike();
+        assert!(state.spike().unwrap().peer.is_none());
+        state.cancel_spike();
+
+        state.advance(WINDOW_MS);
+        assert!(state.activity().is_empty());
+        let quiet = state.sidebar_activity();
+        assert_eq!(
+            quiet.iter().map(|u| u.unit.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        state.move_unit(1);
+        state.begin_spike();
+        let spike = state.spike().unwrap();
+        assert_eq!(spike.unit, "b");
+        assert_eq!(spike.peer.as_ref().unwrap().unit, "a");
+        assert!(
+            spike
+                .bins
+                .iter()
+                .all(|bin| bin.count == 0 && bin.drivers.is_empty())
+        );
+        state.cancel_spike();
+        state.toggle_pin().unwrap();
+        assert_eq!(state.sidebar_activity().len(), 1);
+        assert!(state.is_pinned("a"));
+    }
+
+    #[test]
+    fn manual_tail_hops_use_first_receipt_and_report_evicted_only_candidates() {
+        let mut state = State::new(3, 16);
+        state.ingest(event("a", 4, "expired row", 999), 0);
+        state.ingest(event("a", 4, "old warning", 80), 5_000);
+        state.ingest(event("a", 6, "selected row", 30), 10_000);
+        state.ingest(event("b", 3, "error", 10), 15_000);
+        state.move_row(-1);
+        assert_eq!(
+            state.selected_group().unwrap().first.message,
+            "selected row"
+        );
+        state.hop_spike(-1).unwrap();
+        assert_eq!(state.spike_hit().unwrap().message, "old warning");
+        assert!(state.hop_spike(-1).unwrap_err().contains("evicted"));
+        assert_eq!(state.spike_hit().unwrap().message, "old warning");
+        state.hop_spike(1).unwrap();
+        assert_eq!(state.spike_hit().unwrap().message, "error");
+        assert!(state.hop_spike(1).is_err());
+    }
+
+    #[test]
+    fn manual_tail_hops_from_an_older_row_start_before_the_retained_minute() {
+        let mut state = State::default();
+        state.ingest(event("worker", 4, "before minute", 80), 0);
+        state.ingest(event("worker", 6, "routine", 40), 10_000);
+        state.ingest(event("worker", 4, "first marked interval", 20), 15_000);
+        state.advance(WINDOW_MS);
+        state.move_row(isize::MIN);
+        assert!(state.hop_spike(-1).unwrap_err().contains("No older"));
+        state.hop_spike(1).unwrap();
+        assert_eq!(state.spike_hit().unwrap().message, "first marked interval");
+        state.jump_live();
+        state.advance(80_000);
+        assert!(state.hop_spike(-1).is_err());
+        state.ingest(event("worker", 3, "fresh error", 10), 80_001);
+        state.hop_spike(-1).unwrap();
+        assert_eq!(state.spike_hit().unwrap().message, "fresh error");
+    }
+
+    #[test]
+    fn tail_paused_before_the_first_receipt_can_hop_forward_to_a_hidden_warning() {
+        let mut state = State::default();
+        state.set_paused(true);
+        state.set_search("absent");
+        state.ingest(event("worker", 4, "warning", 1), 2);
+        assert!(state.hop_spike(-1).is_err());
+        state.hop_spike(1).unwrap();
+        assert!(state.spike_hit_hidden());
+        assert_eq!(state.spike_hit().unwrap().message, "warning");
     }
 
     #[test]

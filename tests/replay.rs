@@ -254,24 +254,10 @@ fn spike_replay_lands_on_the_occurrence_inside_the_frozen_interval() {
 #[test]
 fn evicted_spike_target_keeps_the_snapshot_and_never_substitutes_a_later_error() {
     let mut state = State::new(2, 20);
-    let send = |state: &mut State, at, message, cursor| {
-        let record = serde_json::json!({
-            "_SYSTEMD_UNIT": "worker.service", "MESSAGE": message,
-            "PRIORITY": "3", "__CURSOR": cursor, "__REALTIME_TIMESTAMP": "0",
-        });
-        let text = record.to_string();
-        let Some(Frame::Event(event)) = Decoder::new(text.as_bytes(), MAX_LINE_BYTES)
-            .next_frame()
-            .unwrap()
-        else {
-            panic!("expected event")
-        };
-        state.ingest(event, at);
-    };
-    send(&mut state, 0, "error", "original");
+    receive(&mut state, 0, "worker.service", 3, "error", "original");
     assert!(state.begin_spike());
-    send(&mut state, 6_000, "different", "next");
-    send(&mut state, 6_001, "error", "later");
+    receive(&mut state, 6_000, "worker.service", 3, "different", "next");
+    receive(&mut state, 6_001, "worker.service", 3, "error", "later");
     assert_eq!(state.counters().evicted_rows, 1);
     assert!(state.jump_to_spike().unwrap_err().contains("evicted"));
     assert_eq!(state.spike().unwrap().bins[11].count, 1);
@@ -285,6 +271,221 @@ fn evicted_spike_target_keeps_the_snapshot_and_never_substitutes_a_later_error()
     assert!(state.begin_spike());
     state.jump_to_spike().unwrap();
     assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("next"));
+}
+
+fn receive(state: &mut State, at: u64, unit: &str, priority: u8, message: &str, cursor: &str) {
+    let record = serde_json::json!({
+        "_SYSTEMD_UNIT": unit, "PRIORITY": priority.to_string(),
+        "MESSAGE": message, "__CURSOR": cursor,
+    });
+    let line = record.to_string();
+    let Some(Frame::Event(event)) = Decoder::new(line.as_bytes(), MAX_LINE_BYTES)
+        .next_frame()
+        .unwrap()
+    else {
+        panic!("expected synthetic journal entry");
+    };
+    state.ingest(event, at);
+}
+
+#[test]
+fn demo_compares_the_muted_volume_driver_with_the_peer_warning() {
+    let mut state = State::default();
+    let mut decoder = Decoder::new(
+        include_bytes!("../fixtures/demo.jsonl").as_slice(),
+        MAX_LINE_BYTES,
+    );
+    while let Some(Frame::Event(event)) = decoder.next_frame().unwrap() {
+        state.ingest(event, 0);
+    }
+    state.set_unit_muted("indexer.service", true).unwrap();
+    state.toggle_pin().unwrap();
+    assert!(state.is_pinned("indexer.service"));
+    state.move_unit(1);
+    assert!(state.begin_spike());
+    let snapshot = state.spike().unwrap();
+    assert_eq!(snapshot.unit, "proxy.service");
+    let peer = snapshot.peer.as_ref().unwrap();
+    assert_eq!(peer.unit, "indexer.service");
+    let bin = &peer.bins[11];
+    assert_eq!(bin.count, 9);
+    assert_eq!(bin.event().unwrap().cursor.as_deref(), Some("demo-09"));
+    let drivers: Vec<(&str, u64)> = bin
+        .drivers
+        .iter()
+        .map(|d| (d.message.as_ref(), d.count))
+        .collect();
+    assert_eq!(
+        drivers,
+        [
+            ("Polling job queue", 6),
+            ("Job queue is backing up", 2),
+            ("Leased work item 82", 1)
+        ]
+    );
+    // Subsequent arrivals and even expiry of both live graphs leave the paired snapshot intact.
+    receive(&mut state, 60_000, "proxy.service", 0, "new error", "new");
+    state.advance(130_000);
+    state.move_spike(-1);
+    state.switch_spike_unit();
+    assert_eq!(state.spike().unwrap().selected, 10);
+    state.move_spike(1);
+    assert_eq!(state.spike().unwrap().bins[11].count, 9);
+    state.switch_spike_unit();
+    assert_eq!(state.spike().unwrap().bins[11].count, 2);
+    state.jump_to_spike().unwrap();
+    assert_eq!(
+        state.spike_hit().unwrap().cursor.as_deref(),
+        Some("demo-04")
+    );
+}
+
+#[test]
+fn replacing_a_pin_requires_unpinning_and_quiet_pins_stay_reachable() {
+    let mut state = State::default();
+    assert!(state.toggle_pin().is_err());
+    for unit in ["a", "b", "c"] {
+        receive(&mut state, 0, unit, 6, "routine", unit);
+    }
+    state.toggle_pin().unwrap();
+    // A single pin inspected on its own never duplicates its graph.
+    assert!(state.begin_spike());
+    assert!(state.spike().unwrap().peer.is_none());
+    state.cancel_spike();
+    state.move_unit(1);
+    state.toggle_pin().unwrap();
+    state.move_unit(1);
+    assert!(state.toggle_pin().is_err());
+    assert!(state.is_pinned("a") && state.is_pinned("b") && !state.is_pinned("c"));
+    // An unrelated selection does not silently displace a member of the pair.
+    assert!(state.begin_spike());
+    assert!(state.spike().unwrap().peer.is_none());
+    state.cancel_spike();
+    state.advance(60_000);
+    let sidebar = state.sidebar_activity();
+    assert_eq!(
+        sidebar
+            .iter()
+            .map(|entry| (entry.unit.as_str(), entry.incoming))
+            .collect::<Vec<_>>(),
+        [("a", 0), ("b", 0)]
+    );
+    state.move_unit(isize::MAX);
+    state.toggle_pin().unwrap();
+    assert!(!state.is_pinned("b"));
+    receive(&mut state, 60_001, "c", 4, "return", "new");
+    state.move_unit(isize::MIN);
+    state.toggle_pin().unwrap();
+    assert!(state.is_pinned("a") && state.is_pinned("c"));
+    assert!(state.begin_spike());
+    assert_eq!(state.spike().unwrap().unit, "c");
+    assert_eq!(state.spike().unwrap().peer.as_ref().unwrap().unit, "a");
+}
+
+#[test]
+fn service_hops_keep_the_selected_lane_through_filtered_entries_and_expiry() {
+    let mut state = State::default();
+    receive(&mut state, 0, "api", 4, "old warning", "api-1");
+    receive(&mut state, 5_000, "db", 3, "peer error", "db-1");
+    receive(&mut state, 10_000, "api", 6, "routine", "api-2");
+    receive(&mut state, 15_000, "api", 3, "failed", "api-3");
+    receive(&mut state, 15_000, "api", 0, "down", "api-4");
+    state.set_solo(Some("db".into()));
+    state.toggle_pin().unwrap(); // api
+    state.move_unit(1);
+    state.toggle_pin().unwrap(); // db
+    assert!(state.begin_spike());
+    state.switch_spike_unit();
+    state.move_spike(isize::MAX);
+    state.jump_to_spike().unwrap();
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("api-3"));
+    state.toggle_expanded();
+    receive(&mut state, 90_000, "db", 0, "unrelated later spike", "live");
+    state.hop_spike(-1).unwrap();
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("api-1"));
+    assert!(state.spike_hit_hidden());
+    assert!(state.expanded_group().is_none());
+    assert!(state.hop_spike(-1).is_err());
+    state.hop_spike(1).unwrap();
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("api-3"));
+    assert!(state.hop_spike(1).is_err());
+    assert_eq!(state.solo(), Some("db"));
+    state.jump_live();
+    state.hop_spike(-1).unwrap();
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("live"));
+}
+
+#[test]
+fn driver_cutoff_breaks_ties_by_exact_text_even_when_the_jump_target_falls_below_it() {
+    let mut state = State::default();
+    for (priority, text) in [
+        (3, "timeout"),
+        (6, "retry"),
+        (6, "retrying"),
+        (6, "Retry"),
+        (6, "poll"),
+    ] {
+        receive(&mut state, 0, "api", priority, text, text);
+    }
+    assert!(state.begin_spike());
+    let bin = &state.spike().unwrap().bins[11];
+    assert_eq!(bin.count, 5);
+    let drivers: Vec<(&str, u64)> = bin
+        .drivers
+        .iter()
+        .map(|d| (d.message.as_ref(), d.count))
+        .collect();
+    assert_eq!(drivers, [("Retry", 1), ("poll", 1), ("retry", 1)]);
+    state.jump_to_spike().unwrap();
+    assert_eq!(state.spike_hit().unwrap().message, "timeout");
+}
+
+#[test]
+fn drivers_and_hops_obey_the_independent_activity_and_row_limits() {
+    let mut state = State::new(4, 4);
+    for _ in 0..5 {
+        receive(&mut state, 0, "api", 4, "over budget", "dropped");
+    }
+    for (at, level, message, cursor) in [
+        (10_000, 4, "slow", "older"),
+        (15_000, 6, "ping", "a"),
+        (15_000, 6, "ping", "b"),
+        (15_000, 4, "ping", "first"),
+        (15_000, 3, "retry", "error"),
+    ] {
+        receive(&mut state, at, "api", level, message, cursor);
+    }
+    assert_eq!(state.counters().activity_dropped, 5);
+    assert!(state.begin_spike());
+    let bin = &state.spike().unwrap().bins[11];
+    let drivers: Vec<(&str, u64)> = bin
+        .drivers
+        .iter()
+        .map(|d| (d.message.as_ref(), d.count))
+        .collect();
+    assert_eq!(drivers, [("ping", 3), ("retry", 1)]);
+    assert_eq!(bin.count, 4);
+    assert_eq!(
+        state
+            .spike()
+            .unwrap()
+            .bins
+            .iter()
+            .map(|b| b.count)
+            .sum::<u64>(),
+        5
+    );
+    state.jump_to_spike().unwrap();
+    // The exact older warning originally existed. A new copy evicts its row.
+    receive(&mut state, 70_000, "api", 4, "slow", "lookalike");
+    assert!(state.hop_spike(-1).unwrap_err().contains("evicted"));
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("error"));
+    state.jump_live();
+    state.hop_spike(-1).unwrap();
+    assert_eq!(
+        state.spike_hit().unwrap().cursor.as_deref(),
+        Some("lookalike")
+    );
 }
 
 #[test]

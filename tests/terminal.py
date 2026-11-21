@@ -253,8 +253,60 @@ def test_jump_to_spike(binary):
         wait_for("Live", "17% shown", "keep this visible", absent=("outside filters", "connection refused"))
 
 
+def test_compare_spike_drivers(binary, fixture):
+    command = [binary, "--input", fixture, "--mute-unit", "indexer.service", "--no-color"]
+    for columns in (80, 104):
+        with terminal(command, columns=columns, lines=24, env={"TZ": "UTC0"}) as (_, keys, wait_for):
+            wait_for("11/min", "9/2/7")
+            keys(b"\tp\x1b[Bp\r")
+            contents = wait_for("Top messages", "↑↓ service", "› proxy.service", "1/2 · Backend latency")
+            assert any("proxy.service" in row and "08:53:20.600" in row for row in contents.splitlines()), contents
+            assert any("indexer.service" in row and "08:53:21.600" in row for row in contents.splitlines()), contents
+            keys(b"\x1b[B")
+            contents = wait_for("› indexer.service", "6/9 · Polling job queue", "2/9 · Job queue")
+            assert "1/9 · Leased work item" in contents, contents
+            assert contents.count("[!") == 2, contents
+            keys(b"\x1b[D")
+            contents = wait_for("5–10s before capture", "empty interval", absent=("6/9 ·",))
+            assert contents.count("[ ·]") == 2, contents
+            keys(b"\x1b[C\r\r")
+            wait_for("Spike cursor demo-09", "Latest cursor demo-10")
+
+
+def test_tail_spike_hops(binary):
+    with terminal([binary, "--input", "-", "--no-color"], columns=80, lines=24, piped=True) as (scope, keys, wait_for):
+        def send(unit, priority, message, cursor):
+            scope.stdin.write(journal_record(unit, priority, message, cursor=cursor).encode())
+            scope.stdin.flush()
+
+        send("db.service", 4, "lock wait", "old-warning")
+        wait_for("1/min", "lock wait")
+        # Journal timestamps are identical; only delivery time separates the graph bins.
+        time.sleep(5.2)
+        send("api.service", 3, "db unavailable", "new-error")
+        send("health.service", 6, "heartbeat", "healthy")
+        wait_for("3/min", "heartbeat")
+        keys(b"/heartbeat\r[\r")
+        wait_for("outside filters", "Spike cursor new-error")
+        # A later error in this same bin must not replace the captured destination.
+        send("api.service", 2, "another failure", "later")
+        wait_for("4/min", "Spike cursor new-error")
+        keys(b"[\r")
+        wait_for("outside filters", "Spike cursor old-warning")
+        keys(b"[")
+        wait_for("No older spike", "Spike cursor old-warning")
+        keys(b"]\r")
+        wait_for("outside filters", "Spike cursor new-error")
+        keys(b"]")
+        wait_for("No newer spike", "Spike cursor new-error")
+        keys(b"g")
+        wait_for("Live", "25% shown", "heartbeat", absent=("outside filters", "Spike cursor"))
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
     test_grouped_demo(sys.argv[1], sys.argv[2])
     test_jump_to_spike(sys.argv[1])
+    test_compare_spike_drivers(sys.argv[1], sys.argv[2])
+    test_tail_spike_hops(sys.argv[1])
