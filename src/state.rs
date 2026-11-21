@@ -518,8 +518,7 @@ impl State {
             .take(BURST_DISTANCE)
             .find(|row| same_source(&row.last, &event))
             .filter(|row| {
-                row.last.priority == event.priority
-                    && row.last.message == event.message
+                same_key(&row.last, &event)
                     && (id - row.last_id == 1
                         || (self.grouping == Grouping::Burst
                             && row.within_burst(&event, id, self.now)))
@@ -1120,6 +1119,33 @@ impl State {
         Ok(())
     }
 
+    /// First press lands on the newest retained activation. Press again to move older.
+    pub fn jump_generation(&mut self) -> Result<(), &'static str> {
+        let before = self
+            .spike_hit
+            .as_ref()
+            .filter(|hit| hit.event.generation().is_some())
+            .map(|hit| hit.group_id);
+        let row = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| before.is_none_or(|id| row.id < id) && row.first.generation().is_some())
+            .ok_or(if before.is_some() {
+                "No earlier generation marker retained"
+            } else {
+                "No generation marker retained"
+            })?;
+        let target = SpikeTarget {
+            receipt_id: row.id,
+            group_id: row.id,
+            event: Arc::clone(&row.first),
+        };
+        self.spike_trail = None;
+        self.land_spike(target);
+        Ok(())
+    }
+
     fn land_spike(&mut self, target: SpikeTarget) {
         self.paused = true;
         self.paused_row = Some(target.group_id);
@@ -1213,7 +1239,11 @@ fn activity_bin(age: u64) -> Option<usize> {
 }
 
 fn same_key(a: &Event, b: &Event) -> bool {
-    same_source(a, b) && a.priority == b.priority && a.message == b.message
+    a.generation().is_none()
+        && b.generation().is_none()
+        && same_source(a, b)
+        && a.priority == b.priority
+        && a.message == b.message
 }
 
 fn same_source(a: &Event, b: &Event) -> bool {
@@ -1243,6 +1273,9 @@ fn event_bytes(event: &Event) -> usize {
         + event.unit.capacity()
         + event.message.capacity()
         + event.unit_metadata.heap_bytes()
+        + event.generation().map_or(0, |g| {
+            size_of_val(g) + g.current.capacity() + g.previous.as_ref().map_or(0, String::capacity)
+        })
 }
 
 #[cfg(test)]
@@ -1257,6 +1290,7 @@ mod tests {
             host: Some("host".to_owned()),
             unit: unit.to_owned(),
             unit_metadata: Default::default(),
+            generation: None,
             message: message.to_owned(),
         }
     }

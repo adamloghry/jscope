@@ -73,7 +73,7 @@
             terminal = pkgs.runCommand "jscope-terminal"
               { nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyte ])) ]; }
               ''
-                python ${./tests/terminal.py} "${lib.getExe binary}" "${./fixtures/demo.jsonl}"
+                python ${./tests/terminal.py} "${lib.getExe binary}" "${./fixtures/demo.jsonl}" "${./fixtures/generations.jsonl}"
                 touch "$out"
               '';
             fmt = pkgs.runCommand "jscope-fmt"
@@ -98,7 +98,8 @@
         }
       );
     in
-    lib.genAttrs [ "packages" "apps" "checks" "devShells" ] (
+    { nixosModules.default = import ./nix/generation-markers.nix; }
+    // lib.genAttrs [ "packages" "apps" "checks" "devShells" ] (
       output: forLinux (system: perSystem.${system}.${output})
     );
 }

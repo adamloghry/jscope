@@ -17,9 +17,14 @@ pub struct Event {
     pub unit: String,
     pub unit_metadata: UnitMetadata,
     pub message: String,
+    pub generation: Option<Box<Generation>>,
 }
 
 impl Event {
+    pub fn generation(&self) -> Option<&Generation> {
+        self.generation.as_deref()
+    }
+
     /// Resolved unit's source field followed by the other available journal fields.
     pub fn unit_fields(&self) -> impl Iterator<Item = (UnitField, &str)> {
         self.unit_metadata
@@ -33,6 +38,54 @@ impl Event {
                     .map(|(source, value)| (*source, value.as_ref())),
             )
     }
+}
+
+/// NixOS system closures carried in the journal, including file and SSH replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Generation {
+    pub previous: Option<String>,
+    pub current: String,
+}
+
+/// A direct Nix store object with a 32-character Nix base32 hash.
+pub fn is_store_path(path: &str) -> bool {
+    const BASE32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+    let Some((hash, name)) = path
+        .strip_prefix("/nix/store/")
+        .and_then(|s| s.split_once('-'))
+    else {
+        return false;
+    };
+    hash.len() == 32
+        && hash.bytes().all(|ch| BASE32.contains(&ch))
+        && (1..=211).contains(&name.len())
+        && name
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || b"+-._?=".contains(&ch))
+}
+
+fn generation(object: &serde_json::Map<String, Value>) -> Option<Box<Generation>> {
+    let matches = |name: &str, expected: &str| {
+        field(object.get(name), |v| v.text(false)).as_deref() == Some(expected)
+    };
+    if !object.contains_key("JSCOPE_MARKER")
+        || !matches("JSCOPE_MARKER", "nixos-activation-v1")
+        || !matches("SYSLOG_IDENTIFIER", "jscope-activation")
+    {
+        return None;
+    }
+    let path = |key| {
+        field(object.get(key), |v| {
+            v.text(false).filter(|s| is_store_path(s))
+        })
+    };
+    let current = path("JSCOPE_CURRENT_SYSTEM")?;
+    let previous = if object.contains_key("JSCOPE_PREVIOUS_SYSTEM") {
+        Some(path("JSCOPE_PREVIOUS_SYSTEM")?)
+    } else {
+        None
+    };
+    Some(Box::new(Generation { current, previous }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,6 +197,7 @@ pub(crate) fn record(line: Option<&[u8]>) -> Frame {
     };
 
     Frame::Event(Event {
+        generation: generation(&object),
         realtime_us: field(object.get("__REALTIME_TIMESTAMP"), |value| value.number()),
         cursor: text("__CURSOR"),
         priority: field(object.get("PRIORITY"), |value| {
@@ -329,6 +383,42 @@ impl LineBuffer {
 mod tests {
     use super::*;
     use std::io::BufReader;
+
+    #[test]
+    fn activation_requires_the_versioned_fields_and_direct_closure_paths() {
+        use serde_json::json;
+        let store = "/nix/store/00000000000000000000000000000000-nixos-system-node";
+        let mut fields = json!({
+            "SYSLOG_IDENTIFIER": "jscope-activation",
+            "JSCOPE_MARKER": "nixos-activation-v1",
+            "JSCOPE_CURRENT_SYSTEM": ["/bogus", store],
+            "MESSAGE": "same text"
+        });
+        let parse = |fields: &Value| {
+            let Frame::Event(event) = record(Some(fields.to_string().as_bytes())) else {
+                panic!("journal event");
+            };
+            event.generation
+        };
+        let boot = parse(&fields).unwrap();
+        assert_eq!(boot.current, store);
+        assert_eq!(boot.previous, None);
+        for malformed in [
+            format!("{store}/bin/sh"),
+            format!("{store} x"),
+            "/nix/store/hash-nixos".into(),
+            "--help".into(),
+        ] {
+            fields["JSCOPE_PREVIOUS_SYSTEM"] = json!(malformed);
+            assert!(parse(&fields).is_none());
+        }
+        fields["JSCOPE_PREVIOUS_SYSTEM"] = json!(store);
+        fields["SYSLOG_IDENTIFIER"] = json!("other");
+        assert!(parse(&fields).is_none());
+        fields["SYSLOG_IDENTIFIER"] = json!("jscope-activation");
+        fields["JSCOPE_MARKER"] = json!("unknown-version");
+        assert!(parse(&fields).is_none());
+    }
 
     #[test]
     fn duplicates_use_first_usable_value_and_binary_is_reversible() {

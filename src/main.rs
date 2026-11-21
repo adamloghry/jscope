@@ -245,6 +245,10 @@ impl Controls {
             KeyCode::Char('c') if !self.service_focus => {
                 self.notice = state.open_context().err().map(String::from);
             }
+            KeyCode::Char('G') => match state.jump_generation() {
+                Ok(()) => self.service_focus = false,
+                Err(reason) => self.notice = Some(reason.to_string()),
+            },
             KeyCode::Char('p') if self.service_focus => {
                 self.notice = state.toggle_pin().err().map(String::from);
             }

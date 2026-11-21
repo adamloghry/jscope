@@ -364,6 +364,23 @@ def test_message_patterns(binary):
         wait_for("Top messages", "1/2 · request 183 timed out")
 
 
+def test_generation_markers(binary, fixture):
+    with terminal([binary, "--input", fixture, "--no-color"], columns=104, lines=28) as (_, keys, wait_for):
+        wait_for("◆ NixOS", "G generation", "4/min")
+        keys(b"/worker\rG")
+        wait_for("Generation · outside filters", "Paused")
+        keys(b"\r")
+        wait_for("Generation cursor activation-3", "Previous system", "Current system", "demo-green", "demo-blue")
+        keys(b"G\r")
+        wait_for("Generation cursor activation-2")
+        keys(b"G\r")
+        wait_for("Generation cursor activation-1", "first activation this boot")
+        keys(b"G")
+        wait_for("No earlier generation marker retained")
+        keys(b"g")
+        wait_for("missed its health check", absent=("outside filters",))
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
@@ -374,3 +391,4 @@ if __name__ == "__main__":
     test_follow_ranked_message(sys.argv[1], sys.argv[2])
     test_cross_service_context(sys.argv[1], sys.argv[2])
     test_message_patterns(sys.argv[1])
+    test_generation_markers(sys.argv[1], sys.argv[3])

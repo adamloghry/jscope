@@ -691,3 +691,38 @@ fn pattern_rankings_freeze_both_lanes_and_follow_the_original_receipts() {
     assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("3"));
     assert!(state.spike_hit_hidden());
 }
+
+#[test]
+fn generation_navigation_visits_each_transition_and_respects_history_eviction() {
+    let mut decoder = Decoder::new(
+        &include_bytes!("../fixtures/generations.jsonl")[..],
+        MAX_LINE_BYTES,
+    );
+    let mut state = State::new(3, 32);
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        let Frame::Event(event) = frame else {
+            panic!("expected valid fixture");
+        };
+        state.ingest(event, 0);
+    }
+    assert_eq!(state.counters().evicted_rows, 1);
+    state.set_search("worker");
+    state.jump_generation().unwrap();
+    assert_eq!(
+        state.spike_hit().unwrap().cursor.as_deref(),
+        Some("activation-3")
+    );
+    assert!(state.spike_hit_hidden());
+    let new = state.spike_hit().unwrap().generation().unwrap().clone();
+    state.jump_generation().unwrap();
+    let prior = state.spike_hit().unwrap().generation().unwrap();
+    assert_eq!(new.previous.as_deref(), Some(prior.current.as_str()));
+    assert_eq!(prior.previous.as_deref(), Some(new.current.as_str()));
+    assert_eq!(
+        state.jump_generation(),
+        Err("No earlier generation marker retained")
+    );
+    state.jump_live();
+    assert_eq!(state.visible_rows().count(), 1);
+    assert_eq!(state.counters().received, 4);
+}

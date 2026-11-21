@@ -269,7 +269,14 @@ fn render_tail(
         Grouping::Burst => "bursts",
         Grouping::Adjacent => "adjacent",
     };
-    let landing = if state.spike_hit_hidden() {
+    let marker = state
+        .spike_hit()
+        .is_some_and(|hit| hit.generation().is_some());
+    let landing = if marker && state.spike_hit_hidden() {
+        " · Generation · outside filters"
+    } else if marker {
+        " · Generation"
+    } else if state.spike_hit_hidden() {
         " · Spike · outside filters"
     } else if state.spike_hit().is_some() {
         " · Spike"
@@ -382,11 +389,15 @@ fn tail_line<'a>(
         Cow::Borrowed("")
     };
     let available = available.saturating_sub(host.width());
-    let short_unit = event
-        .unit
-        .strip_suffix(".service")
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or(&event.unit);
+    let short_unit = if event.generation().is_some() {
+        "◆ NixOS"
+    } else {
+        event
+            .unit
+            .strip_suffix(".service")
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(&event.unit)
+    };
     let unit = truncate_display(short_unit, available.saturating_sub(12).min(available / 2));
     let message = truncate_display(&event.message, available.saturating_sub(unit.width()));
     let unit_style = unit_style(&event.unit, no_color);
@@ -809,17 +820,32 @@ fn render_details(
             "occurrences"
         }
     )];
+    if let Some(generation) = entry.generation() {
+        fields.push(format!(
+            "Previous system  {}",
+            generation
+                .previous
+                .as_deref()
+                .unwrap_or("(first activation this boot)")
+        ));
+        fields.push(format!("Current system   {}", generation.current));
+    }
     let realtime = |timestamp: Option<u64>| {
         timestamp.map_or_else(|| "(missing)".to_owned(), |us| us.to_string())
     };
     if let Some(hit) = hit {
+        let label = if hit.generation().is_some() {
+            "Generation"
+        } else {
+            "Spike"
+        };
         fields.push(format!(
-            "Spike local {} · Journal realtime µs {}",
+            "{label} local {} · Journal realtime µs {}",
             crate::local_time::format(hit.realtime_us),
             realtime(hit.realtime_us)
         ));
         fields.push(format!(
-            "Spike cursor {}",
+            "{label} cursor {}",
             hit.cursor.as_deref().unwrap_or("(missing)")
         ));
     }
@@ -1090,6 +1116,13 @@ fn render_footer(
             keys.extend([("Enter", "spike"), ("p", "pin"), ("s", "solo")]);
         } else {
             keys.extend([("↵", "view"), ("[]", "spikes"), ("c", "context")]);
+            if state
+                .rows()
+                .iter()
+                .any(|row| row.first.generation().is_some())
+            {
+                keys.push(("G", "generation"));
+            }
         }
         keys.extend([
             ("g", "live"),
@@ -1260,6 +1293,7 @@ mod tests {
             host: Some("fixture-host".to_string()),
             unit: "noisy.service".to_string(),
             unit_metadata: UnitMetadata::new(UnitField::SystemUnit, Box::new([])),
+            generation: None,
             message: message.to_string(),
         }
     }

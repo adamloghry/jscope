@@ -6,6 +6,9 @@ pkgs.testers.runNixOSTest {
   qemu.forceAccel = false;
 
   nodes.machine = { pkgs, ... }: {
+    imports = [ ./generation-markers.nix ];
+    programs.jscope.generationMarkers.enable = true;
+    specialisation.marker-test.configuration.environment.etc."jscope-specialisation".text = "test";
     environment.systemPackages = [ binary pkgs.python3 ];
     services.journald.storage = "persistent";
 
@@ -31,6 +34,16 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import json
+
+    def markers():
+        machine.succeed("journalctl --sync")
+        return [
+            json.loads(line) for line in machine.succeed(
+                "journalctl -b SYSLOG_IDENTIFIER=jscope-activation JSCOPE_MARKER=nixos-activation-v1 -o json"
+            ).splitlines() if line.startswith("{")
+        ]
+
     def send_target(phase: str) -> None:
         machine.succeed(f"echo {phase} > /run/jscope-phase")
         machine.succeed("systemctl start jscope-target.service; journalctl --sync")
@@ -67,6 +80,19 @@ pkgs.testers.runNixOSTest {
     machine.start()
     machine.wait_for_unit("systemd-journald.service")
     machine.wait_for_unit("systemd-journal-flush.service")
+    machine.wait_for_unit("multi-user.target")
+    base = machine.succeed("readlink -e /run/current-system").strip()
+    special = machine.succeed("readlink -e /run/current-system/specialisation/marker-test").strip()
+    assert [m["JSCOPE_CURRENT_SYSTEM"] for m in markers()] == [base]
+    assert "JSCOPE_PREVIOUS_SYSTEM" not in markers()[0]
+    machine.succeed(f"{special}/bin/switch-to-configuration dry-activate")
+    machine.succeed(f"{base}/bin/switch-to-configuration test")
+    assert len(markers()) == 1
+    machine.succeed(f"{special}/bin/switch-to-configuration test")
+    machine.succeed(f"{base}/bin/switch-to-configuration test")
+    assert [(m.get("JSCOPE_PREVIOUS_SYSTEM"), m["JSCOPE_CURRENT_SYSTEM"]) for m in markers()] == [
+        (None, base), (base, special), (special, base)
+    ]
     send_target("PRIOR_BOOT")
     machine.shutdown()
 
@@ -76,6 +102,8 @@ pkgs.testers.runNixOSTest {
     machine.succeed(
         "journalctl -b -1 -u jscope-target.service -p err -o cat | grep JSCOPE_PRIOR_BOOT_KEEP"
     )
+    machine.wait_for_unit("multi-user.target")
+    assert [m["JSCOPE_CURRENT_SYSTEM"] for m in markers()] == [base]
     send_target("PREEXISTING")
     exercise_follow("BACKLOG_FOLLOW", 10)
     exercise_follow("ZERO_FOLLOW", 0)

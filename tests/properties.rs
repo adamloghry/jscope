@@ -54,6 +54,7 @@ fn journal_record(variant: u8, number: usize) -> (Vec<u8>, Frame) {
         host: None,
         unit: "(unknown)".to_owned(),
         unit_metadata: UnitMetadata::default(),
+        generation: None,
         message: String::new(),
     };
     let fields = match variant {
@@ -388,6 +389,7 @@ impl Model {
                         host: HOSTS[host].map(str::to_owned),
                         unit: UNITS[unit].to_owned(),
                         unit_metadata: UnitMetadata::default(),
+                        generation: None,
                         message: MESSAGES[message].to_owned(),
                     };
                     self.events.push((self.now, event.clone()));
@@ -548,6 +550,7 @@ fn spike_jumps_match_individual_receipts_in_each_five_second_interval(tc: TestCa
             host: Some("host".into()),
             unit: UNITS[unit].into(),
             unit_metadata: Default::default(),
+            generation: None,
             message: "tick".into(),
         };
         state.ingest(event.clone(), at);
@@ -635,6 +638,7 @@ fn unique_bursts_stay_bounded_without_losing_warnings_when_muted(tc: TestCase) {
                 host: None,
                 unit: UNITS[0].to_owned(),
                 unit_metadata: UnitMetadata::default(),
+                generation: None,
                 message: index.to_string(),
             },
             0,
@@ -703,6 +707,7 @@ fn paired_drivers_and_global_hops_match_ungrouped_receipts(tc: TestCase) {
             unit: unit.into(),
             host: None,
             unit_metadata: Default::default(),
+            generation: None,
             priority,
             message: message.into(),
         };
@@ -813,6 +818,7 @@ fn recovery_matches_a_known_rate_step_with_steady_background(tc: TestCase) {
         host: None,
         unit: unit.into(),
         unit_metadata: UnitMetadata::default(),
+        generation: None,
         message: "tick".into(),
     };
 
@@ -870,6 +876,7 @@ fn pattern_counts_and_originals_match_the_ungrouped_messages(tc: TestCase) {
                 priority: Some(6),
                 host: None,
                 unit: UNITS[0].into(),
+                generation: None,
                 unit_metadata: Default::default(),
                 message,
             };

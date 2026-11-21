@@ -66,6 +66,14 @@ Press **[** from live to land on the newest five-second interval containing a wa
 
 After an inspector jump, the brackets follow the service you jumped from. After manually selecting a log row, they search across services, starting on either side of the interval containing the row's first arrival. Navigation holds the captured minute still while intake continues. **g** returns to live, ready for a fresh capture.
 
+## NixOS activation markers
+
+Import the flake's default NixOS module and set `programs.jscope.generationMarkers.enable = true;` to record system activations. Each boot gets one journal entry identifying the booted system closure. A live switch, test activation, or rollback to a different closure records both store paths. Equal-closure reactivation and dry activation produce no marker. Enable the option in the configurations you want to track.
+
+A **◆ NixOS** row marks the transition. Press **G** in the tail or service list to jump to the newest retained marker. Press **G** again for an earlier one. **Enter** opens its full paths and journal cursor. A filtered marker is temporarily revealed. **g** returns to live. Native journal selectors still determine which markers arrive. File and SSH replay carry the same fields.
+
+Try a boot, a switch and a rollback with `nix run . -- --input fixtures/generations.jsonl`.
+
 ## Try a synthetic replay
 
 ```sh
@@ -107,6 +115,7 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | 1 / 2 / 3 in the inspector | Follow that ranked message in the selected service and interval |
 | ← / → while following a message | Move to the previous or next exact occurrence. Enter jumps to the tail, Esc goes back to the graph |
 | c | Open a ±2-second cross-service context window from the tail or occurrence browser. Esc returns |
+| G | Jump to the newest retained NixOS activation, then step backwards through earlier activations |
 | p | Pin or unpin the selected service for comparison (up to two) |
 | ← / → | Select an older or newer five-second interval in the inspector |
 | ↑ / ↓ in a paired inspector | Switch the active service at the same interval |
