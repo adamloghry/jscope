@@ -83,7 +83,7 @@ def terminal(command, *, columns, lines, piped=False, env=None):
         os.close(slave)
 
 
-def journal_record(unit, level, message, realtime_us=0):
+def journal_record(unit, level, message, realtime_us=0, cursor=None):
     record = {
         "_SYSTEMD_UNIT": unit,
         "PRIORITY": str(level),
@@ -91,6 +91,8 @@ def journal_record(unit, level, message, realtime_us=0):
         "MESSAGE": message,
         "__REALTIME_TIMESTAMP": str(realtime_us),
     }
+    if cursor is not None:
+        record["__CURSOR"] = cursor
     return json.dumps(record) + "\n"
 
 
@@ -214,7 +216,45 @@ def test_grouped_demo(binary, fixture):
             wait_for("_SYSTEMD_UNIT=indexer.service", f"Latest cursor {latest_cursor}")
 
 
+def test_jump_to_spike(binary):
+    command = [binary, "--input", "-", "--no-color"]
+    with terminal(command, columns=80, lines=24, piped=True, env={"TZ": "UTC0"}) as (scope, keys, wait_for):
+        records = [
+            ("worker.service", 4, "early warning", 1_000_000, "warning"),
+            ("worker.service", 3, "connection refused", 2_000_000, "first-error"),
+            ("worker.service", 3, "connection refused", 3_000_000, "repeated-error"),
+            ("worker.service", 0, "later emergency", 4_000_000, "emergency"),
+            ("other.service", 6, "keep this visible", 5_000_000, "heartbeat"),
+        ]
+        scope.stdin.write("".join(journal_record(*record) for record in records).encode())
+        scope.stdin.flush()
+        wait_for("5/min", "connection refused")
+        keys(b"/keep this visible\r\t")
+        wait_for("worker.service", "4/0/4", "Enter spike")
+        keys(b"\r")
+        wait_for("Spike · 60s snapshot", "[×]", "connection refused", "Enter jump")
+        keys(b"\x1b")
+        wait_for("Enter spike", absent=("60s snapshot",))
+        keys(b"\r")
+        wait_for("0–5s before capture", "4 entries")
+
+        # New arrivals change the live graph while the chosen bar keeps its original target.
+        scope.stdin.write(journal_record("worker.service", 3, "new arrival", 6_000_000, "new-error").encode())
+        scope.stdin.flush()
+        wait_for("6/min", "4 entries")
+        keys(b"\x1b[D\r")
+        wait_for("5–10s before capture", "This interval is empty")
+        keys(b"\x1b[C\r")
+        contents = wait_for("Paused", "outside filters", "00:00:02", "connection refused")
+        assert "later emergency" not in contents, contents
+        keys(b"\r")
+        wait_for("Spike cursor first-error", "Latest cursor repeated-error")
+        keys(b"g")
+        wait_for("Live", "17% shown", "keep this visible", absent=("outside filters", "connection refused"))
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
     test_grouped_demo(sys.argv[1], sys.argv[2])
+    test_jump_to_spike(sys.argv[1])

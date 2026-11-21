@@ -188,6 +188,106 @@ fn lower_ranked_service_signals_a_filtered_error_burst_on_intake_time() {
 }
 
 #[test]
+fn spike_replay_lands_on_the_occurrence_inside_the_frozen_interval() {
+    let fixture = include_bytes!("../fixtures/demo.jsonl");
+    let mut decoder = Decoder::new(fixture.as_slice(), MAX_LINE_BYTES);
+    let mut state = State::default();
+    for at in [
+        0, 0, 0, 3_000, 5_000, 5_002, 7_000, 7_500, 10_000, 10_001, 13_000,
+    ] {
+        let Some(Frame::Event(event)) = decoder.next_frame().unwrap() else {
+            panic!("missing demo event");
+        };
+        state.ingest(event, at);
+    }
+    state.advance(15_000);
+    state.set_search("proxy");
+    state.set_solo(Some("proxy.service".into()));
+    state.set_unit_muted("indexer.service", true).unwrap();
+    let activity = state.activity();
+    assert_eq!(activity[0].visible, 0);
+    assert_eq!(state.visible_rows().count(), 2);
+
+    assert!(state.begin_spike());
+    assert_eq!(state.spike().unwrap().selected, 11);
+    state.jump_to_spike().unwrap();
+    let group = state.selected_group().unwrap();
+    assert_eq!(group.first.cursor.as_deref(), Some("demo-09"));
+    assert_eq!(group.count, 2);
+    // Just one millisecond apart on intake, the adjacent warnings straddle the bin edge.
+    let hit = state.spike_hit().unwrap();
+    assert_eq!(hit.cursor.as_deref(), Some("demo-10"));
+    assert_eq!(hit.realtime_us, Some(1_760_000_001_800_000));
+    assert!(state.spike_hit_hidden());
+    assert_eq!(state.visible_rows().count(), 3);
+    assert_eq!(state.activity(), activity);
+    assert_eq!(state.search(), "proxy");
+    assert_eq!(state.solo(), Some("proxy.service"));
+    assert!(state.is_unit_muted("indexer.service"));
+    state.toggle_expanded();
+    assert_eq!(state.expanded_group().unwrap().id, 9);
+    assert!(state.spike_hit().is_some());
+    state.move_row(-1);
+    assert!(state.spike_hit().is_none());
+    assert_eq!(state.selected_group().unwrap().id, 8);
+    assert_eq!(state.visible_rows().count(), 2);
+
+    state.jump_live();
+    assert!(state.begin_spike());
+    state.move_spike(-2);
+    assert_eq!(state.spike().unwrap().bins[9].count, 1);
+    state.advance(90_000);
+    assert!(state.activity().is_empty());
+    state.jump_to_spike().unwrap();
+    let poll = state.selected_group().unwrap();
+    assert_eq!((poll.id, poll.count), (1, 4));
+    assert_eq!(poll.first.cursor.as_deref(), Some("demo-01"));
+    assert_eq!(
+        state.spike_hit().unwrap().cursor.as_deref(),
+        Some("demo-05")
+    );
+    state.jump_live();
+    assert!(state.spike_hit().is_none());
+    assert_eq!(state.visible_rows().count(), 2);
+}
+
+#[test]
+fn evicted_spike_target_keeps_the_snapshot_and_never_substitutes_a_later_error() {
+    let mut state = State::new(2, 20);
+    let send = |state: &mut State, at, message, cursor| {
+        let record = serde_json::json!({
+            "_SYSTEMD_UNIT": "worker.service", "MESSAGE": message,
+            "PRIORITY": "3", "__CURSOR": cursor, "__REALTIME_TIMESTAMP": "0",
+        });
+        let text = record.to_string();
+        let Some(Frame::Event(event)) = Decoder::new(text.as_bytes(), MAX_LINE_BYTES)
+            .next_frame()
+            .unwrap()
+        else {
+            panic!("expected event")
+        };
+        state.ingest(event, at);
+    };
+    send(&mut state, 0, "error", "original");
+    assert!(state.begin_spike());
+    send(&mut state, 6_000, "different", "next");
+    send(&mut state, 6_001, "error", "later");
+    assert_eq!(state.counters().evicted_rows, 1);
+    assert!(state.jump_to_spike().unwrap_err().contains("evicted"));
+    assert_eq!(state.spike().unwrap().bins[11].count, 1);
+    assert!(state.spike_hit().is_none());
+    state.move_spike(isize::MIN);
+    assert!(state.jump_to_spike().unwrap_err().contains("empty"));
+    state.move_spike(isize::MAX);
+    assert_eq!(state.spike().unwrap().selected, 11);
+    state.cancel_spike();
+    assert!(!state.is_paused());
+    assert!(state.begin_spike());
+    state.jump_to_spike().unwrap();
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("next"));
+}
+
+#[test]
 fn replay_file_source_preserves_order_and_reports_eof() {
     let source = Source::input(&Path::new(env!("CARGO_MANIFEST_DIR")).join(DEMO)).unwrap();
     assert_eq!(source.child_id(), None);

@@ -25,6 +25,14 @@ The service list ranks units by incoming activity. The service graphs share a sc
 - **↑ beside a unit** means it received at least three entries in the last five seconds, at a rate at least twice its average over the preceding minute. After 15 seconds of observation, the arrow can use the portion of that minute already observed. A previously quiet unit can qualify. The comparison pauses if its history is incomplete after a buffer eviction.
 - **Amber and red bars** mark time intervals containing a warning or an error, respectively. Critical, alert and emergency entries also turn the bar red. Height still shows volume, and the most severe entry sets the color. With `--no-color`, `!` marks a warning and `×` marks an error or higher. These markers follow incoming events even while a search, mute or solo hides the corresponding log rows.
 
+### Jump from a spike to its journal entry
+
+Press **Tab** to focus services, **↑/↓** to choose a unit, then **Enter** to inspect its last minute. The graph holds twelve five-second intervals still while new records continue arriving. It starts on the newest red interval, then prefers the newest warning if there are no errors. For routine traffic it selects the busiest interval, favoring the more recent one on a tie.
+
+Use **←/→** to select a bar. The preview shows the first error-or-higher entry in a red interval, the first warning in an amber interval, or the first arrival in a routine interval. Press **Enter** to pause the tail at that occurrence. If a display filter hid the entry, the tail temporarily reveals it and labels it **outside filters**. Press **Enter** again for its exact journal timestamp and cursor, including when the event is part of a repeat group. **g** returns to the filtered live tail.
+
+**Esc** closes the inspector and returns to the service list. If a bar is empty or its original row has been evicted, you can pick another interval.
+
 ## Try a synthetic replay
 
 ```sh
@@ -32,6 +40,8 @@ nix run . -- --input fixtures/demo.jsonl --mute-unit indexer.service
 ```
 
 For the first 60 seconds, `indexer.service` leads with nine incoming entries, two visible, and seven suppressed. Its two warnings collapse into one row. The notice from `proxy.service` also stays visible. Press Enter to inspect the repeated warning. Press Tab to focus services and Shift+M to unmute the indexer.
+
+To try **jump to spike** in this demo, press **Tab**, then **Enter** twice. The tail lands on the first “Job queue is backing up” warning. Enter opens details showing the matched cursor `demo-09` and the group's latest cursor `demo-10`.
 
 To see the rising-rate indicator with synthetic input, send the fixture again after a quiet interval. Watch the indexer gain `↑` for five seconds when the second burst arrives. The warning bars from both bursts remain in the graph as they age.
 
@@ -55,7 +65,8 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | --- | --- |
 | Tab | Switch focus between tail and services |
 | ↑ / ↓ | Select a group or a service |
-| Enter | Expand or close the selected tail group |
+| Enter | In the tail, expand or close details. In services, inspect the unit's graph. In the inspector, jump to the selected interval |
+| ← / → | Select an older or newer five-second interval in the inspector |
 | PgUp / PgDn | Scroll through expanded entry details |
 | s | Solo the selected service or clear solo |
 | m | Toggle muting below warning across all services |
@@ -63,7 +74,8 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | / | Search unit, host, and message text without case sensitivity. Enter accepts, Esc restores the previous query, and Ctrl+U clears the query |
 | Space | Pause or resume tail scrolling while intake continues |
 | End or g | Jump to the live tail |
-| q, Esc, or Ctrl+C | Quit |
+| Esc | Return from the inspector to services, cancel a search, or quit from the main view |
+| q or Ctrl+C | Quit (while entering a search, use Ctrl+C) |
 
 ## Reading the journal tail
 

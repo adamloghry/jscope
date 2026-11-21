@@ -1,9 +1,12 @@
-use crate::state::{BinSeverity, Group, Grouping, SPARK_BINS, State, UnitActivity};
+use crate::journal::Event;
+use crate::state::{
+    BinSeverity, Group, Grouping, SPARK_BINS, SpikeSnapshot, State, UnitActivity, WINDOW_MS,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -71,9 +74,16 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     } else {
         render_tail(frame, body, state, status, no_color);
     }
-    render_footer(frame, footer, status, no_color);
+    render_footer(frame, footer, state, status, no_color);
     expanded.map_or(0, |group| {
-        render_details(frame, details, group, state.detail_scroll(), no_color)
+        render_details(
+            frame,
+            details,
+            group,
+            state.spike_hit(),
+            state.detail_scroll(),
+            no_color,
+        )
     })
 }
 
@@ -250,8 +260,18 @@ fn render_tail(
         Grouping::Burst => "bursts",
         Grouping::Adjacent => "adjacent",
     };
+    let landing = if state.spike_hit_hidden() {
+        " · Spike · outside filters"
+    } else if state.spike_hit().is_some() {
+        " · Spike"
+    } else {
+        ""
+    };
     let block = section(
-        format!("Journal · local · {grouping}{}", filter_status(state)),
+        format!(
+            "Journal{landing} · local · {grouping}{}",
+            filter_status(state)
+        ),
         !status.service_focus,
         no_color,
     );
@@ -279,6 +299,11 @@ fn render_tail(
             };
             lines.push(tail_line(
                 row,
+                if row.id == selected.id {
+                    state.spike_hit()
+                } else {
+                    None
+                },
                 gutter,
                 row.id == selected.id && state.is_paused() && !status.service_focus,
                 state.show_hosts(),
@@ -312,16 +337,17 @@ fn render_tail(
 
 fn tail_line<'a>(
     row: &'a Group,
+    hit: Option<&'a Event>,
     gutter: &'static str,
     selected: bool,
     show_host: bool,
     no_color: bool,
     width: usize,
 ) -> Line<'a> {
-    let event = &row.first;
+    let event = hit.unwrap_or(&row.first);
     let (severity, severity_style) = severity(event.priority, no_color);
     let first = crate::local_time::format(event.realtime_us);
-    let stamp = if width < 65 {
+    let stamp = if width < 65 && hit.is_none() {
         first[..8].to_owned()
     } else {
         first
@@ -330,7 +356,7 @@ fn tail_line<'a>(
         format!(
             " ×{}/{} ",
             row.count,
-            elapsed(event.realtime_us, row.last.realtime_us)
+            elapsed(row.first.realtime_us, row.last.realtime_us)
         )
     } else {
         " ".to_owned()
@@ -453,6 +479,10 @@ fn render_activity(
     summaries: &[UnitActivity],
     no_color: bool,
 ) {
+    if let Some(spike) = state.spike() {
+        render_spike(frame, area, spike, no_color);
+        return;
+    }
     let title = if status.service_focus {
         format!("Services · 60s{}", filter_status(state))
     } else {
@@ -512,6 +542,64 @@ fn render_activity(
     frame.render_widget(Paragraph::new(lines), list);
 }
 
+fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_color: bool) {
+    let block = section("Spike · 60s snapshot".into(), true, no_color);
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+    let counts = spike.bins.each_ref().map(|bin| bin.count);
+    let severities = spike.bins.each_ref().map(|bin| bin.severity);
+    let unit = unit_style(&spike.unit, no_color);
+    let accent = colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut chart = Vec::new();
+    for (index, bar) in
+        sparkline(&counts, &severities, SPARK_BINS, None, unit, no_color).enumerate()
+    {
+        let marker = if index == spike.selected {
+            "["
+        } else if index == spike.selected + 1 {
+            "]"
+        } else {
+            " "
+        };
+        chart.push(Span::styled(marker, accent));
+        chart.push(bar);
+    }
+    if spike.selected + 1 == SPARK_BINS {
+        chart.push(Span::styled("]", accent));
+    }
+    let bin = &spike.bins[spike.selected];
+    let seconds = WINDOW_MS / SPARK_BINS as u64 / 1_000;
+    let age = (SPARK_BINS - 1 - spike.selected) as u64 * seconds;
+    let mut lines = vec![
+        Line::styled(
+            truncate_display(&spike.unit, usize::from(content.width)),
+            unit,
+        ),
+        Line::from(chart),
+        Line::styled(format!("{age}–{}s before capture", age + seconds), dim),
+    ];
+    if let Some(event) = bin.event() {
+        let target = match bin.severity {
+            BinSeverity::Normal => "first arrival",
+            BinSeverity::Warning => "first warning",
+            BinSeverity::Error => "first error or higher",
+        };
+        let entries = if bin.count == 1 { "entry" } else { "entries" };
+        lines.push(Line::from(format!("{} {entries} · {target}", bin.count)));
+        let (label, severity_style) = severity(event.priority, no_color);
+        lines.push(Line::from(vec![
+            Span::styled(crate::local_time::format(event.realtime_us), dim),
+            Span::raw(" "),
+            Span::styled(label, severity_style),
+        ]));
+        lines.push(Line::raw(&event.message));
+    } else {
+        lines.push(Line::from("0 entries · empty interval"));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), content);
+}
+
 fn activity_spans<'a>(
     state: &State,
     entry: &'a UnitActivity,
@@ -564,12 +652,13 @@ fn render_details(
     frame: &mut Frame<'_>,
     area: Rect,
     group: &Group,
+    hit: Option<&Event>,
     scroll: usize,
     no_color: bool,
 ) -> usize {
-    let entry = &group.last;
+    let entry = hit.unwrap_or(&group.last);
     let host = entry.host.as_deref().unwrap_or("(unknown)");
-    let cursor = entry.cursor.as_deref().unwrap_or("(missing)");
+    let cursor = group.last.cursor.as_deref().unwrap_or("(missing)");
     let priority = severity(entry.priority, true).0;
     let mut fields = vec![format!(
         "{} · host {host} · {priority} · {} {}",
@@ -584,17 +673,28 @@ fn render_details(
     let realtime = |timestamp: Option<u64>| {
         timestamp.map_or_else(|| "(missing)".to_owned(), |us| us.to_string())
     };
-    if group.count == 1 {
+    if let Some(hit) = hit {
+        fields.push(format!(
+            "Spike local {} · Journal realtime µs {}",
+            crate::local_time::format(hit.realtime_us),
+            realtime(hit.realtime_us)
+        ));
+        fields.push(format!(
+            "Spike cursor {}",
+            hit.cursor.as_deref().unwrap_or("(missing)")
+        ));
+    }
+    if group.count > 1 {
+        fields.push(format!(
+            "Journal realtime µs {} → {}",
+            realtime(group.first.realtime_us),
+            realtime(group.last.realtime_us),
+        ));
+    } else if hit.is_none() {
         fields.push(format!(
             "Local {} · Journal realtime µs {}",
             crate::local_time::format(entry.realtime_us),
             realtime(entry.realtime_us)
-        ));
-    } else {
-        fields.push(format!(
-            "Journal realtime µs {} → {}",
-            realtime(group.first.realtime_us),
-            realtime(entry.realtime_us),
         ));
     }
     fields.extend(
@@ -668,7 +768,13 @@ fn wrap_line<'a>(text: &'a str, width: usize, lines: &mut Vec<&'a str>) {
     lines.push(&text[start..]);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, status: &Status<'_>, no_color: bool) {
+fn render_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    status: &Status<'_>,
+    no_color: bool,
+) {
     if let Some(query) = status.search_input {
         let hint = if area.width >= 40 {
             "  Enter apply · Esc cancel"
@@ -691,19 +797,33 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, status: &Status<'_>, no_colo
         "services"
     };
     let separator = if area.width >= 88 { "  " } else { " " };
-    let keys = [
-        ("q", "quit"),
-        ("Tab", pane),
-        ("↑↓", "move"),
-        ("↵", "view"),
-        ("s", "solo"),
-        ("m/M", "mute"),
-        ("/", "find"),
-        ("Space", "pause"),
-        ("g", "live"),
-    ];
+    let keys: &[(&str, &str)] = if state.spike().is_some() {
+        &[
+            ("←→", "interval"),
+            ("Enter", "jump"),
+            ("Esc", "back"),
+            ("g", "live"),
+            ("q", "quit"),
+        ]
+    } else {
+        &[
+            ("q", "quit"),
+            ("Tab", pane),
+            ("↑↓", "move"),
+            if status.service_focus {
+                ("Enter", "spike")
+            } else {
+                ("↵", "view")
+            },
+            ("s", "solo"),
+            ("m/M", "mute"),
+            ("/", "find"),
+            ("Space", "pause"),
+            ("g", "live"),
+        ]
+    };
     let mut remaining = usize::from(area.width);
-    for (key, action) in keys {
+    for &(key, action) in keys {
         let width = key.width() + 1 + action.width();
         if width > remaining {
             break;
@@ -893,6 +1013,104 @@ mod tests {
 
     fn screen(width: u16, height: u16, state: &State, status: &Status<'_>) -> Vec<String> {
         lines(&render_buffer(width, height, state, status, true))
+    }
+
+    fn spike_replay() -> State {
+        let mut state = State::default();
+        for (at, priority, message, cursor) in [
+            (0, 4, "queue slow", "warning"),
+            (7_000, 3, "queue failed", "first-in-group"),
+            (16_000, 3, "queue failed", "first-in-bin"),
+            (16_100, 3, "queue failed", "last-in-group"),
+        ] {
+            let mut entry = event(message, priority, 1_740_000_000_000_000 + at * 1_000);
+            entry.cursor = Some(cursor.into());
+            state.ingest(entry, at);
+        }
+        state.set_search("excluded");
+        assert!(state.begin_spike());
+        state
+    }
+
+    #[test]
+    fn spike_inspector_keeps_all_twelve_intervals_and_their_first_matches() {
+        let mut state = spike_replay();
+        let status = Status {
+            service_focus: true,
+            ..Default::default()
+        };
+        for width in [80, 104] {
+            for no_color in [true, false] {
+                let buf = render_buffer(width, 24, &state, &status, no_color);
+                let rows = lines(&buf);
+                let view = rows.join("\n");
+                assert!(view.contains("Spike · 60s snapshot"), "{view}");
+                assert!(view.contains("noisy.service"), "{view}");
+                assert!(view.contains("0–5s before capture"), "{view}");
+                assert!(view.contains("2 entries · first error or higher"), "{view}");
+                assert!(view.contains("queue failed"), "{view}");
+                assert!(
+                    view.contains("Enter jump") && view.contains("Esc back"),
+                    "{view}"
+                );
+                let (y, chart) = rows
+                    .iter()
+                    .enumerate()
+                    .find(|(_, line)| line.contains('['))
+                    .unwrap();
+                let bins = chart.chars().filter(|c| "·!×▁▂▃▄▅▆▇█".contains(*c)).count();
+                assert_eq!(bins, SPARK_BINS, "{chart}");
+                if no_color {
+                    assert!(chart.contains('!') && chart.contains("[×]"), "{chart}");
+                } else {
+                    let (left, _) = chart.split_once("[█]").unwrap();
+                    assert_eq!(buf[(left.width() as u16 + 1, y as u16)].fg, Color::LightRed);
+                }
+            }
+        }
+        state.advance(90_000);
+        state.move_spike(-1);
+        let view = screen(80, 24, &state, &status).join("\n");
+        assert!(
+            view.contains("5–10s before capture") && view.contains("1 entry · first error"),
+            "{view}"
+        );
+        state.move_spike(-1);
+        let view = screen(80, 24, &state, &status).join("\n");
+        assert!(
+            view.contains("[·]") && view.contains("0 entries · empty interval"),
+            "{view}"
+        );
+    }
+
+    #[test]
+    fn jump_lands_on_filtered_repeat_with_its_own_timestamp_and_cursor() {
+        let mut state = spike_replay();
+        state.jump_to_spike().unwrap();
+        let status = Status::default();
+        let view = screen(80, 24, &state, &status);
+        assert!(
+            view.iter()
+                .any(|line| line.contains("Spike · outside filters"))
+        );
+        let hit = view.iter().find(|line| line.starts_with("› ")).unwrap();
+        let time = crate::local_time::format(Some(1_740_000_016_000_000));
+        assert!(
+            hit.contains(&time) && hit.contains("×3/9s") && hit.contains("ERROR queue failed"),
+            "{hit}"
+        );
+        state.toggle_expanded();
+        let view = screen(80, 24, &state, &status).join("\n");
+        assert!(view.contains("Spike cursor first-in-bin"), "{view}");
+        assert!(view.contains("Latest cursor last-in-group"), "{view}");
+        assert!(
+            view.contains("Journal realtime µs 1740000016000000"),
+            "{view}"
+        );
+        assert!(
+            view.contains("1740000007000000 → 1740000016100000"),
+            "{view}"
+        );
     }
 
     #[test]

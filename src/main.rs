@@ -202,8 +202,15 @@ impl Controls {
             self.edit_search(key, state);
             return true;
         }
+        if key.code == KeyCode::Char('q') {
+            return false;
+        }
+        if state.spike().is_some() {
+            self.spike_key(key.code, state);
+            return true;
+        }
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return false,
+            KeyCode::Esc => return false,
             KeyCode::Tab => self.service_focus = !self.service_focus,
             KeyCode::Up | KeyCode::Down => {
                 let delta = if key.code == KeyCode::Up { -1 } else { 1 };
@@ -215,7 +222,11 @@ impl Controls {
             }
             KeyCode::PageUp => state.scroll_details(-6, self.detail_scroll_limit),
             KeyCode::PageDown => state.scroll_details(6, self.detail_scroll_limit),
-            KeyCode::Enter if !self.service_focus => state.toggle_expanded(),
+            KeyCode::Enter if self.service_focus => {
+                self.notice =
+                    (!state.begin_spike()).then(|| "No service has activity to inspect".into());
+            }
+            KeyCode::Enter => state.toggle_expanded(),
             KeyCode::Char('s') => state.toggle_solo(),
             KeyCode::Char('m') => state.toggle_mute(),
             KeyCode::Char('M') => {
@@ -227,6 +238,27 @@ impl Controls {
             _ => {}
         }
         true
+    }
+
+    fn spike_key(&mut self, code: KeyCode, state: &mut State) {
+        match code {
+            KeyCode::Left => state.move_spike(-1),
+            KeyCode::Right => state.move_spike(1),
+            KeyCode::Enter => match state.jump_to_spike() {
+                Ok(()) => self.service_focus = false,
+                Err(reason) => self.notice = Some(reason.to_string()),
+            },
+            KeyCode::Esc => state.cancel_spike(),
+            KeyCode::Tab => {
+                state.cancel_spike();
+                self.service_focus = false;
+            }
+            KeyCode::Char('g') | KeyCode::End => {
+                state.jump_live();
+                self.service_focus = false;
+            }
+            _ => {}
+        }
     }
 
     fn edit_search(&mut self, key: KeyEvent, state: &mut State) {

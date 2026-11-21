@@ -105,6 +105,8 @@ impl Group {
 #[derive(Debug)]
 struct Intake {
     at: u64,
+    /// History row of the first occurrence represented by this intake record.
+    group_id: u64,
     event: Arc<Event>,
     count: u64,
 }
@@ -125,6 +127,46 @@ impl BinSeverity {
             _ => Self::Normal,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SpikeTarget {
+    group_id: u64,
+    event: Arc<Event>,
+}
+
+#[derive(Debug, Default)]
+pub struct SpikeBin {
+    pub count: u64,
+    pub severity: BinSeverity,
+    target: Option<SpikeTarget>,
+}
+
+impl SpikeBin {
+    /// First incoming occurrence of the severity displayed by this bin.
+    pub fn event(&self) -> Option<&Event> {
+        self.target.as_ref().map(|target| target.event.as_ref())
+    }
+
+    fn add(&mut self, entry: &Intake) {
+        let severity = BinSeverity::from_priority(entry.event.priority);
+        if self.count == 0 || severity > self.severity {
+            self.severity = severity;
+            self.target = Some(SpikeTarget {
+                group_id: entry.group_id,
+                event: Arc::clone(&entry.event),
+            });
+        }
+        self.count += entry.count;
+    }
+}
+
+/// One service's incoming minute, frozen at the instant inspection begins.
+#[derive(Debug)]
+pub struct SpikeSnapshot {
+    pub unit: String,
+    pub bins: [SpikeBin; SPARK_BINS],
+    pub selected: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -171,6 +213,8 @@ pub struct State {
     search_lower: String,
     paused: bool,
     paused_row: Option<u64>,
+    spike: Option<SpikeSnapshot>,
+    spike_hit: Option<SpikeTarget>,
     selected_unit: Option<String>,
     expanded: Option<u64>,
     detail_scroll: usize,
@@ -204,6 +248,8 @@ impl State {
             search_lower: String::new(),
             paused: false,
             paused_row: None,
+            spike: None,
+            spike_hit: None,
             selected_unit: None,
             expanded: None,
             detail_scroll: 0,
@@ -233,11 +279,11 @@ impl State {
         }
 
         let event = Arc::new(event);
-        self.record_activity(Arc::clone(&event));
-        self.record_row(event);
+        let group_id = self.record_row(Arc::clone(&event));
+        self.record_activity(event, group_id);
     }
 
-    fn record_activity(&mut self, event: Arc<Event>) {
+    fn record_activity(&mut self, event: Arc<Event>, group_id: u64) {
         if let Some(last) = self.intake.back_mut()
             && last.at == self.now
             && same_key(&last.event, &event)
@@ -249,6 +295,7 @@ impl State {
         self.activity_bytes += event_bytes(&event);
         self.intake.push_back(Intake {
             at: self.now,
+            group_id,
             event,
             count: 1,
         });
@@ -267,7 +314,7 @@ impl State {
         removed
     }
 
-    fn record_row(&mut self, event: Arc<Event>) {
+    fn record_row(&mut self, event: Arc<Event>) -> u64 {
         let id = self.counters.received;
         // An interleaved match starts within the last eight events. Immediate repeats can
         // extend it indefinitely, but cannot insert any newer rows between those repeats.
@@ -284,10 +331,11 @@ impl State {
                         || (self.grouping == Grouping::Burst
                             && row.within_burst(&event, id, self.now)))
             });
-        if let Some(group) = repeat {
+        let group_id = if let Some(group) = repeat {
             self.row_bytes -= group.bytes();
             group.push(event, id, self.now);
             self.row_bytes += group.bytes();
+            group.id
         } else {
             self.row_bytes += event_bytes(&event);
             let realtime_us = event.realtime_us;
@@ -301,7 +349,8 @@ impl State {
                 last: event,
                 times: VecDeque::from([realtime_us]),
             });
-        }
+            id
+        };
         while self.rows.len() > self.max_rows || self.row_bytes > MAX_ROW_BYTES {
             let removed = self.rows.pop_front().expect("a row to remove");
             self.row_bytes -= removed.bytes();
@@ -310,7 +359,15 @@ impl State {
             if self.expanded == Some(removed.id) {
                 self.expanded = None;
             }
+            if self
+                .spike_hit
+                .as_ref()
+                .is_some_and(|hit| hit.group_id == removed.id)
+            {
+                self.spike_hit = None;
+            }
         }
+        group_id
     }
 
     pub fn rows(&self) -> &VecDeque<Group> {
@@ -347,10 +404,12 @@ impl State {
     }
 
     pub(crate) fn indexed_visible_rows(&self) -> impl DoubleEndedIterator<Item = (usize, &Group)> {
-        self.rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| self.matches(&row.first))
+        self.rows.iter().enumerate().filter(|(_, row)| {
+            self.spike_hit
+                .as_ref()
+                .is_some_and(|hit| hit.group_id == row.id)
+                || self.matches(&row.first)
+        })
     }
 
     pub fn activity(&self) -> Vec<UnitActivity> {
@@ -374,14 +433,13 @@ impl State {
         for entry in self.intake.iter().rev() {
             let unit = entry.event.unit.as_str();
             let age = self.now - entry.at;
-            if age >= WINDOW_MS {
+            let Some(bin) = activity_bin(age) else {
                 if let Some((_, extra)) = totals.get_mut(unit) {
                     *extra += entry.count;
                 }
                 continue;
-            }
+            };
             let (summary, _) = totals.entry(unit).or_default();
-            let bin = SPARK_BINS - 1 - (age / BIN_MS) as usize;
             summary.sparkline[bin] += entry.count;
             summary.severity[bin] =
                 summary.severity[bin].max(BinSeverity::from_priority(entry.event.priority));
@@ -436,6 +494,7 @@ impl State {
 
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
+        self.spike_hit = None;
     }
 
     pub fn toggle_mute(&mut self) {
@@ -448,7 +507,9 @@ impl State {
 
     pub fn set_unit_muted(&mut self, unit: &str, muted: bool) -> Result<(), UnitMuteLimit> {
         if !muted {
-            self.muted_units.remove(unit);
+            if self.muted_units.remove(unit) {
+                self.spike_hit = None;
+            }
             return Ok(());
         }
         if self.is_unit_muted(unit) {
@@ -465,6 +526,7 @@ impl State {
             return Err(UnitMuteLimit);
         }
         self.muted_units.insert(unit.into());
+        self.spike_hit = None;
         Ok(())
     }
 
@@ -482,6 +544,7 @@ impl State {
 
     pub fn set_solo(&mut self, unit: Option<String>) {
         self.solo = unit;
+        self.spike_hit = None;
     }
 
     pub fn toggle_solo(&mut self) {
@@ -512,6 +575,7 @@ impl State {
         self.search.clear();
         self.search.push_str(query);
         self.search_lower = query.to_lowercase();
+        self.spike_hit = None;
     }
 
     pub fn is_paused(&self) -> bool {
@@ -526,6 +590,7 @@ impl State {
         if !paused {
             self.paused_row = None;
             self.expanded = None;
+            self.spike_hit = None;
         }
         self.paused = paused;
     }
@@ -535,6 +600,7 @@ impl State {
     }
 
     pub fn jump_live(&mut self) {
+        self.cancel_spike();
         self.set_paused(false);
     }
 
@@ -559,8 +625,15 @@ impl State {
             .and_then(|selected| row_ids.binary_search(&selected.id).ok())
             .unwrap_or(row_ids.len() - 1);
         let next = current.saturating_add_signed(delta).min(row_ids.len() - 1);
+        let releasing_revealed_row =
+            self.spike_hit_hidden() && self.paused_row == Some(row_ids[next]);
+        self.spike_hit = None;
         self.paused = true;
         self.paused_row = Some(row_ids[next]);
+        if releasing_revealed_row {
+            // A clamped move can still point to the row whose filter exception just ended.
+            self.paused_row = self.selected_group().map(|row| row.id);
+        }
         if self.paused_row != self.expanded {
             self.expanded = None;
         }
@@ -568,6 +641,93 @@ impl State {
 
     pub fn selected_unit(&self) -> Option<&str> {
         self.selected_unit.as_deref()
+    }
+
+    pub fn begin_spike(&mut self) -> bool {
+        let activity = self.sidebar_activity();
+        let Some(selected) = self.sidebar_selection(&activity) else {
+            self.spike = None;
+            return false;
+        };
+        let mut bins: [SpikeBin; SPARK_BINS] = Default::default();
+        for entry in &self.intake {
+            if entry.event.unit == selected.unit
+                && let Some(bin) = activity_bin(self.now - entry.at)
+            {
+                bins[bin].add(entry);
+            }
+        }
+        // Highlight the latest severe bin. With routine traffic, prefer the largest burst.
+        let index = bins
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, bin)| {
+                let volume = if bin.severity == BinSeverity::Normal {
+                    bin.count
+                } else {
+                    0
+                };
+                (bin.severity, volume)
+            })
+            .expect("a minute has at least one bin")
+            .0;
+        self.spike = Some(SpikeSnapshot {
+            unit: selected.unit.clone(),
+            bins,
+            selected: index,
+        });
+        true
+    }
+
+    pub fn spike(&self) -> Option<&SpikeSnapshot> {
+        self.spike.as_ref()
+    }
+
+    pub fn move_spike(&mut self, delta: isize) {
+        if let Some(spike) = &mut self.spike {
+            spike.selected = spike
+                .selected
+                .saturating_add_signed(delta)
+                .min(SPARK_BINS - 1);
+        }
+    }
+
+    pub fn cancel_spike(&mut self) {
+        self.spike = None;
+    }
+
+    pub fn jump_to_spike(&mut self) -> Result<(), &'static str> {
+        let spike = self
+            .spike
+            .as_ref()
+            .ok_or("Select a service interval first")?;
+        let target = spike.bins[spike.selected]
+            .target
+            .as_ref()
+            .ok_or("This interval is empty")?;
+        if self
+            .rows
+            .binary_search_by_key(&target.group_id, |row| row.id)
+            .is_err()
+        {
+            return Err("The journal row for this spike was evicted");
+        }
+        self.paused = true;
+        self.paused_row = Some(target.group_id);
+        self.expanded = None;
+        self.detail_scroll = 0;
+        self.spike_hit = Some(target.clone());
+        self.spike = None;
+        Ok(())
+    }
+
+    /// The exact occurrence selected in the graph, even inside a repeat group.
+    pub fn spike_hit(&self) -> Option<&Event> {
+        self.spike_hit.as_ref().map(|hit| hit.event.as_ref())
+    }
+
+    pub fn spike_hit_hidden(&self) -> bool {
+        self.spike_hit().is_some_and(|event| !self.matches(event))
     }
 
     fn sidebar_selection<'a>(&self, activity: &'a [UnitActivity]) -> Option<&'a UnitActivity> {
@@ -624,6 +784,10 @@ impl State {
     }
 }
 
+fn activity_bin(age: u64) -> Option<usize> {
+    (age < WINDOW_MS).then(|| SPARK_BINS - 1 - (age / BIN_MS) as usize)
+}
+
 fn same_key(a: &Event, b: &Event) -> bool {
     same_source(a, b) && a.priority == b.priority && a.message == b.message
 }
@@ -671,6 +835,129 @@ mod tests {
             unit_metadata: Default::default(),
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn spike_defaults_to_latest_severe_bin_or_busiest_routine_bin() {
+        let mut state = State::default();
+        assert!(!state.begin_spike());
+        state.set_unit_muted("worker", true).unwrap();
+        assert!(state.begin_spike());
+        assert_eq!(state.spike().unwrap().selected, 11);
+        assert!(state.jump_to_spike().unwrap_err().contains("empty"));
+
+        let e = event("worker", 6, "routine", 0);
+        for _ in 0..4 {
+            state.ingest(e.clone(), 0);
+        }
+        state.ingest(e.clone(), 5_000);
+        state.begin_spike();
+        assert_eq!(state.spike().unwrap().selected, 10);
+        for _ in 0..3 {
+            state.ingest(e.clone(), 5_000);
+        }
+        state.begin_spike();
+        assert_eq!(state.spike().unwrap().selected, 11);
+        state.ingest(event("worker", 4, "warning", 1), 6_000);
+        state.ingest(e, 20_000);
+        state.begin_spike();
+        assert_eq!(state.spike().unwrap().selected, 9);
+        state.ingest(event("worker", 0, "emergency", 2), 21_000);
+        state.ingest(event("worker", 3, "error", 3), 27_000);
+        state.ingest(event("worker", 4, "warning", 4), 33_000);
+        state.begin_spike();
+        assert_eq!(state.spike().unwrap().selected, 10);
+        state.move_spike(isize::MIN);
+        assert_eq!(state.spike().unwrap().selected, 0);
+        state.move_spike(isize::MAX);
+        assert_eq!(state.spike().unwrap().selected, 11);
+        state.cancel_spike();
+        assert!(state.spike().is_none());
+    }
+
+    #[test]
+    fn spike_retains_first_occurrence_in_its_bin_after_live_data_expires() {
+        let mut state = State::default();
+        // One repeat group spans two bins. Two copies at the same intake millisecond
+        // are one intake record, whose first cursor must remain the jump target.
+        state.ingest(event("api", 3, "retry", 10), 0);
+        state.ingest(event("api", 3, "retry", 5), 6_000);
+        state.ingest(event("api", 3, "retry", 20), 6_000);
+        state.ingest(event("api", 1, "worse", 30), 6_001);
+        state.set_search("anything else");
+        let before = state.activity();
+        state.begin_spike();
+        assert_eq!(state.spike().unwrap().bins[11].count, 3);
+        assert_eq!(
+            state.spike().unwrap().bins[11]
+                .event()
+                .unwrap()
+                .cursor
+                .as_deref(),
+            Some("5")
+        );
+        state.advance(100_000);
+        assert!(state.activity().is_empty());
+        state.jump_to_spike().unwrap();
+        assert!(state.spike_hit_hidden());
+        assert!(state.is_paused());
+        assert!(state.expanded_group().is_none());
+        assert_eq!(state.selected_group().unwrap().count, 3);
+        assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("5"));
+        state.toggle_expanded();
+        assert_eq!(
+            state.expanded_group().unwrap().last.cursor.as_deref(),
+            Some("20")
+        );
+        assert!(state.spike_hit_hidden());
+        state.jump_live();
+        assert_eq!(state.visible_rows().count(), 0);
+        assert!(state.spike_hit().is_none());
+        assert_eq!(state.search(), "anything else");
+        assert_eq!(before[0].visible, 0);
+    }
+
+    #[test]
+    fn landed_event_leaves_tail_after_navigation_filter_edit_or_eviction() {
+        let mut state = State::new(3, 16);
+        state.ingest(event("api", 4, "target", 1), 0);
+        state.ingest(event("api", 6, "context", 2), 1);
+        state.set_search("context");
+        for action in ["navigate", "search", "solo", "mute", "evict"] {
+            state.begin_spike();
+            state.jump_to_spike().unwrap();
+            assert!(state.spike_hit_hidden());
+            assert_eq!(state.visible_rows().count(), 2);
+            assert_eq!(state.activity()[0].visible, 1);
+            match action {
+                "navigate" => state.move_row(1),
+                "search" => state.set_search("CONTEXT"),
+                "solo" => state.set_solo(Some("api".into())),
+                "mute" => state.set_unit_muted("other", true).unwrap(),
+                _ => {
+                    state.ingest(event("other", 4, "new", 3), 2);
+                    state.ingest(event("other", 4, "newest", 4), 3);
+                }
+            }
+            assert!(state.spike_hit().is_none());
+            assert_eq!(state.selected_group().unwrap().first.message, "context");
+        }
+    }
+
+    #[test]
+    fn leaving_a_revealed_row_at_the_boundary_reanchors_to_visible_history() {
+        let mut state = State::default();
+        state.ingest(event("api", 4, "hit", 1), 1);
+        state.ingest(event("api", 6, "context", 2), 2);
+        state.set_search("context");
+        state.begin_spike();
+        state.jump_to_spike().unwrap();
+        state.toggle_expanded();
+        state.move_row(-1);
+        state.set_search("");
+        assert!(state.spike_hit().is_none());
+        assert!(state.expanded_group().is_none());
+        assert_eq!(state.selected_group().unwrap().id, 2);
     }
 
     #[test]

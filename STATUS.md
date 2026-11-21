@@ -27,6 +27,10 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-21 | UI owner, activity strip and service panel | verified | JS-20 | None |
 | JS-22 | Test owner, Hegel and replay | verified | JS-20 | None |
 | JS-23 | Integrator, packaged terminal, docs and checks | verified | JS-20–22 | None on x86_64-linux |
+| JS-24 | State owner, spike snapshots and tail anchors | verified | JS-16, JS-20 | None |
+| JS-25 | UI owner, graph inspector and landing view | verified | JS-21, JS-24 | None |
+| JS-26 | Test owner, model and replay tests | verified | JS-24 | None |
+| JS-27 | Integrator, controls, PTY tests, docs and check-in | verified | JS-24–26 | None on x86_64-linux |
 
 ## Shared contract
 
@@ -38,6 +42,8 @@ The default burst grouping also folds exact routine repeats across other sources
 
 Graph bins keep the worst incoming severity. The rising arrow compares five seconds of intake to up to 60 preceding seconds within the existing activity memory budget. It becomes eligible after 15 seconds of observation, requires at least three arrivals and a twofold rate increase, and waits for complete comparison history after a capacity loss. The extra five seconds of retention are used only for that comparison.
 
+Inspecting a service captures twelve five-second intake bins and at most one representative event per bin. A jump anchors the paused tail at the earliest occurrence of the displayed severity class. A filtered hit gets a temporary one-row reveal. A target evicted from tail history reports eviction, even if a later entry has identical text.
+
 Replay has no control records or timing directives. Tests advance the state clock independently of journal timestamps. In the demo, `indexer.service` leads the first 60 seconds with 9 incoming, 2 visible, and 7 suppressed occurrences. Its paired warnings appear as one group.
 
 ## Recent decisions
@@ -48,10 +54,16 @@ Replay has no control records or timing directives. Tests advance the state cloc
 
 ## Verification evidence
 
-- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 48 Rust tests including three Hegel properties, four replay tests, four retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
+- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 57 Rust tests including four Hegel properties, six replay tests, four retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
 - `nix build .#vm-test --no-link -L` passed on x86_64-linux in a disposable NixOS VM. It verified real journalctl follow, matching unit and priority filters, exclusion of archived records from a prior guest boot, zero and nonzero backlogs, SIGTERM shutdown, child reaping, and restored terminal settings. All logs used for the test were synthetic guest records.
 - The exact README replay command passed in an 80×24 pseudo-terminal. File and piped replay also passed direct PTY smoke tests, including details, unmute, clean quit, and terminal restoration with the pipe still open. `nix run . -- --help` verified the default app entry point.
 - `nix flake check --all-systems --no-build` evaluated package, app, dev shell, standard checks, and VM check for x86_64-linux and aarch64-linux. The environment exposes x86_64 builders only, so aarch64-linux build and runtime tests remain open.
+
+## Jump-to-spike verification
+
+- The packaged app passed a piped 80×24 terminal test with a hidden error, a repeated copy and a later emergency in the same interval. New traffic changed the live rate while the inspectable bin stayed at four entries. The test covered cancel, an empty interval, jumping, exact and latest cursors, and return to the original filtered tail.
+- The README demo keystrokes passed at 80×24 and 104×24. Both landed on the indexer's first warning, cursor `demo-09`, within the group ending at `demo-10`. Deterministic tests separately land on a repeat from an older group that spans multiple intake bins. A 150-case Hegel property compares every selectable bin against the individual original receipts, including evicted targets.
+- The final sandboxed flake check and two-boot VM check passed on x86_64-linux. Both supported flake outputs evaluated. Native aarch64-linux execution remains tracked in JS-06.
 
 ## Activity indicator verification
 

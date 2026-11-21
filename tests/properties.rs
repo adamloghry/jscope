@@ -510,6 +510,114 @@ fn burst_and_view_actions_match_a_full_history_model(tc: TestCase) {
     }
 }
 
+#[hegel::test(test_cases = 150)]
+fn spike_jumps_match_individual_receipts_in_each_five_second_interval(tc: TestCase) {
+    let row_limit = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
+    let grouping = if tc.draw(gs::booleans()) {
+        Grouping::Burst
+    } else {
+        Grouping::Adjacent
+    };
+    let forward = tc.draw(gs::booleans());
+    let mut state = State::new(row_limit, 128);
+    state.set_grouping(grouping);
+    let mut model = Model::new(row_limit, grouping);
+    model.now = 65_000;
+    let mut records = tc.draw(
+        gs::vecs(hegel::tuples!(
+            gs::integers::<u8>().max_value(13),
+            gs::integers::<u8>().max_value(2),
+            gs::integers::<usize>().max_value(2),
+            gs::integers::<u8>().max_value(8)
+        ))
+        .min_size(1)
+        .max_size(64),
+    );
+    // Include exact bin edges, one millisecond inside/outside, and equal intake times.
+    records.sort_by_key(|&(bucket, offset, _, _)| (bucket, offset));
+    for (index, (bucket, offset, unit, level)) in records.into_iter().enumerate() {
+        let at = (u64::from(bucket) * 5_000 + [0, 1, 4_999][usize::from(offset)]).min(model.now);
+        let event = Event {
+            realtime_us: Some(if forward {
+                index as u64
+            } else {
+                1_000_000 - index as u64
+            }),
+            cursor: Some(format!("cursor-{index}")),
+            priority: (level < 8).then_some(level),
+            host: Some("host".into()),
+            unit: UNITS[unit].into(),
+            unit_metadata: Default::default(),
+            message: "tick".into(),
+        };
+        state.ingest(event.clone(), at);
+        model.events.push((at, event));
+    }
+    state.advance(model.now);
+    let activity = model.activity();
+    if activity.is_empty() {
+        assert!(!state.begin_spike());
+        return;
+    }
+    let unit_index = tc.draw(gs::integers::<usize>().max_value(activity.len() - 1));
+    state.move_unit(unit_index as isize);
+    let unit = &activity[unit_index];
+    let hide = tc.draw(gs::booleans());
+    if hide {
+        state.set_search("no match");
+    }
+    let counts = state.activity();
+    let groups = model.rows();
+    let retained = &groups[groups.len().saturating_sub(row_limit)..];
+    let initial = (0..12)
+        .rev()
+        .find(|&bin| unit.severity[bin] == BinSeverity::Error)
+        .or_else(|| {
+            (0..12)
+                .rev()
+                .find(|&bin| unit.severity[bin] == BinSeverity::Warning)
+        })
+        .unwrap_or_else(|| (0..12).max_by_key(|&bin| unit.sparkline[bin]).unwrap());
+    for bin in 0..12 {
+        assert!(state.begin_spike());
+        let snapshot = state.spike().unwrap();
+        assert_eq!(snapshot.unit, unit.unit);
+        assert_eq!(snapshot.selected, initial);
+        assert_eq!(snapshot.bins[bin].count, unit.sparkline[bin]);
+        assert_eq!(snapshot.bins[bin].severity, unit.severity[bin]);
+        state.move_spike(isize::MIN);
+        state.move_spike(bin as isize);
+        assert_eq!(state.spike().unwrap().selected, bin);
+        let ages = (11 - bin as u64) * 5_000..(12 - bin as u64) * 5_000;
+        let target = model.events.iter().enumerate().find(|(_, (at, event))| {
+            let class = match unit.severity[bin] {
+                BinSeverity::Error => matches!(event.priority, Some(0..=3)),
+                BinSeverity::Warning => event.priority == Some(4),
+                BinSeverity::Normal => true,
+            };
+            class && event.unit == unit.unit && ages.contains(&(model.now - at))
+        });
+        if let Some((index, (_, occurrence))) = target
+            && let Some(row) = retained.iter().find(|row| row.contains(&index))
+        {
+            state.jump_to_spike().unwrap();
+            assert_eq!(state.spike_hit(), Some(occurrence));
+            assert_eq!(state.selected_group().unwrap().id, row[0] as u64 + 1);
+            assert_eq!(state.spike_hit_hidden(), hide);
+            assert!(state.is_paused());
+            assert!(state.spike().is_none());
+            state.jump_live();
+            assert!(state.spike_hit().is_none());
+        } else {
+            assert!(state.jump_to_spike().is_err());
+            assert_eq!(state.spike().unwrap().selected, bin);
+            assert!(!state.is_paused());
+            state.cancel_spike();
+        }
+        assert_eq!(state.activity(), counts);
+    }
+}
+
 #[hegel::test(test_cases = 100)]
 fn unique_bursts_stay_bounded_without_losing_warnings_when_muted(tc: TestCase) {
     let rows = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
