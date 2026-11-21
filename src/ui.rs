@@ -661,7 +661,14 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
         ]));
         lines.push(Line::raw(truncate_display(&event.message, width)));
         lines.push(Line::from(vec![
-            Span::styled("Top messages", accent),
+            Span::styled(
+                if spike.patterns {
+                    "Top patterns"
+                } else {
+                    "Top messages"
+                },
+                accent,
+            ),
             Span::styled(" · prev→now/total", dim),
         ]));
         for (rank, driver) in bin.drivers.iter().enumerate() {
@@ -1061,6 +1068,7 @@ fn render_footer(
             ("←→", "interval"),
             ("Enter", "jump"),
             ("1–3", "follow"),
+            ("t", if spike.patterns { "exact" } else { "patterns" }),
             ("Esc", "back"),
             ("g", "live"),
             ("q", "quit"),

@@ -61,11 +61,12 @@ impl State {
                 .iter()
                 .chain(spike.peer.iter().flat_map(|lane| &lane.bins));
             for bin in bins {
-                for receipt in bin
-                    .target
-                    .iter()
-                    .chain(bin.drivers.iter().flat_map(|d| &d.receipts))
-                {
+                for receipt in bin.target.iter().chain(
+                    bin.drivers
+                        .iter()
+                        .chain(&bin.alternate_drivers)
+                        .flat_map(|d| &d.receipts),
+                ) {
                     add(receipt.receipt_id, &receipt.event);
                 }
             }

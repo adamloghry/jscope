@@ -1,10 +1,12 @@
 mod context;
+mod pattern;
 mod recovery;
 
 pub use context::Surroundings;
 
 use crate::journal::{Event, UNKNOWN_UNIT};
 use recovery::Recoveries;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -122,6 +124,23 @@ struct Intake {
     count: u64,
 }
 
+/// Capture-time keys for one retained intake record. Tally zero precedes the graph.
+struct DriverRecord<'a> {
+    tally: usize,
+    intake: &'a Intake,
+    pattern: Cow<'a, str>,
+}
+
+impl DriverRecord<'_> {
+    fn key(&self, patterns: bool) -> &str {
+        if patterns {
+            &self.pattern
+        } else {
+            &self.intake.event.message
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BinSeverity {
     #[default]
@@ -158,7 +177,7 @@ impl SpikeTarget {
 pub struct MessageCount {
     pub message: String,
     pub count: u64,
-    /// Count of this exact text in the previous five seconds, if fully observed.
+    /// Count for the same message or pattern in a fully observed preceding interval.
     pub previous_count: Option<u64>,
     receipts: Vec<SpikeTarget>,
 }
@@ -173,8 +192,9 @@ impl MessageCount {
 pub struct SpikeBin {
     pub count: u64,
     pub severity: BinSeverity,
-    /// The most frequent incoming message texts, ordered by count then text.
+    /// The top incoming messages in the selected grouping, ordered by count then text.
     pub drivers: Vec<MessageCount>,
+    alternate_drivers: Vec<MessageCount>,
     target: Option<SpikeTarget>,
 }
 
@@ -224,6 +244,7 @@ pub struct SpikeSnapshot {
     pub peer: Option<SpikeLane>,
     /// Preserve each graph's screen position when switching the active service.
     pub peer_first: bool,
+    pub patterns: bool,
     // Driver rank and position among its retained receipts, in arrival order.
     following: Option<(usize, usize)>,
 }
@@ -845,18 +866,44 @@ impl State {
 
     fn capture_lane(&self, unit: &str) -> SpikeLane {
         let mut bins: [SpikeBin; SPARK_BINS] = Default::default();
+        let mut records = Vec::new();
+        for entry in self.intake.iter().filter(|entry| entry.event.unit == unit) {
+            let tally = activity_bin(self.now - entry.at).map_or(0, |index| {
+                bins[index].add(entry);
+                index + 1
+            });
+            records.push(DriverRecord {
+                tally,
+                intake: entry,
+                pattern: pattern::message_pattern(&entry.event.message),
+            });
+        }
+        let exact = self.rank_drivers(&records, false);
+        let patterns = self.rank_drivers(&records, true);
+        for ((bin, drivers), alternate) in bins.iter_mut().zip(exact).zip(patterns) {
+            bin.drivers = drivers;
+            bin.alternate_drivers = alternate;
+        }
+        SpikeLane {
+            unit: unit.to_owned(),
+            recovery: self.recovery(unit),
+            bins,
+        }
+    }
+
+    fn rank_drivers(
+        &self,
+        records: &[DriverRecord<'_>],
+        patterns: bool,
+    ) -> [Vec<MessageCount>; SPARK_BINS] {
         // The first tally covers the extra five seconds before the visible graph.
         let mut messages: [BTreeMap<&str, u64>; SPARK_BINS + 1] = Default::default();
-        for entry in self.intake.iter().filter(|entry| entry.event.unit == unit) {
-            let tally = if let Some(index) = activity_bin(self.now - entry.at) {
-                bins[index].add(entry);
-                &mut messages[index + 1]
-            } else {
-                &mut messages[0]
-            };
-            *tally.entry(&entry.event.message).or_default() += entry.count;
+        for record in records {
+            *messages[record.tally]
+                .entry(record.key(patterns))
+                .or_default() += record.intake.count;
         }
-        for (index, bin) in bins.iter_mut().enumerate() {
+        let mut result: [Vec<MessageCount>; SPARK_BINS] = std::array::from_fn(|index| {
             let previous = &messages[index];
             let age_at_start = COMPARISON_WINDOW_MS - index as u64 * BIN_MS;
             let complete = self.now >= age_at_start
@@ -866,7 +913,7 @@ impl State {
             let mut ranked: Vec<_> = messages[index + 1].iter().collect();
             ranked.sort_unstable_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
             // The tally borrows intake text. Only the winners survive capture.
-            bin.drivers = ranked
+            ranked
                 .into_iter()
                 .take(MAX_MESSAGE_DRIVERS)
                 .map(|(&message, &count)| MessageCount {
@@ -875,18 +922,13 @@ impl State {
                     previous_count: complete.then(|| previous.get(message).copied().unwrap_or(0)),
                     receipts: Vec::new(),
                 })
-                .collect();
-        }
-        // Freeze only the three ranked messages. Each intake representative is
-        // exact; merge its retained repeat receipts before advancing to the next.
-        for (index, entry) in self
-            .window_entries()
-            .filter(|(_, entry)| entry.event.unit == unit)
-        {
-            let Some(driver) = bins[index]
-                .drivers
+                .collect()
+        });
+        for record in records.iter().filter(|record| record.tally != 0) {
+            let entry = record.intake;
+            let Some(driver) = result[record.tally - 1]
                 .iter_mut()
-                .find(|driver| driver.message == entry.event.message)
+                .find(|driver| driver.message == record.key(patterns))
             else {
                 continue;
             };
@@ -907,11 +949,7 @@ impl State {
                 );
             }
         }
-        SpikeLane {
-            unit: unit.to_owned(),
-            recovery: self.recovery(unit),
-            bins,
-        }
+        result
     }
 
     pub fn begin_spike(&mut self) -> bool {
@@ -954,6 +992,7 @@ impl State {
             selected: index,
             peer,
             peer_first: false,
+            patterns: false,
             following: None,
         });
         true
@@ -970,6 +1009,18 @@ impl State {
                 .selected
                 .saturating_add_signed(delta)
                 .min(SPARK_BINS - 1);
+        }
+    }
+
+    /// Switch both lanes between the two rankings frozen at capture time.
+    pub fn toggle_message_patterns(&mut self) {
+        if let Some(spike) = &mut self.spike {
+            spike.following = None;
+            spike.patterns = !spike.patterns;
+            let peer_bins = spike.peer.iter_mut().flat_map(|peer| &mut peer.bins);
+            for bin in spike.bins.iter_mut().chain(peer_bins) {
+                std::mem::swap(&mut bin.drivers, &mut bin.alternate_drivers);
+            }
         }
     }
 

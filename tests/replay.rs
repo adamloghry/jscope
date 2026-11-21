@@ -603,3 +603,91 @@ fn parser_regression_fixture_covers_duplicate_binary_and_control_fields() {
     assert_eq!(last.message, "\\(message unavailable)");
     assert_eq!(decoder.next_frame().unwrap(), None);
 }
+
+#[test]
+fn pattern_rankings_freeze_both_lanes_and_follow_the_original_receipts() {
+    let mut state = State::default();
+    receive(
+        &mut state,
+        6_000,
+        "api",
+        6,
+        "request 831 failed",
+        "previous-api",
+    );
+    receive(&mut state, 6_000, "db", 6, "job 42 done", "previous-db");
+    for (cursor, message) in [
+        ("1", "request 183 failed"),
+        ("2", "request 942 failed"),
+        ("3", "request 942 failed"),
+        ("4", "request 530 failed"),
+        ("5", "request {id} failed"),
+        ("6", "heartbeat"),
+    ] {
+        receive(&mut state, 11_000, "api", 6, message, cursor);
+    }
+    receive(&mut state, 11_000, "db", 4, "job 8 done", "peer");
+    state.set_search("none");
+    state.toggle_pin().unwrap(); // api
+    state.move_unit(1); // inspect db alongside pinned api
+    assert!(state.begin_spike());
+    state.switch_spike_unit();
+    assert_eq!(
+        state.spike().unwrap().bins[11].drivers[0].message,
+        "request 942 failed"
+    );
+    state.advance(120_000);
+    state.toggle_message_patterns();
+    let spike = state.spike().unwrap();
+    assert_eq!(spike.bins[11].count, 6);
+    let drivers = &spike.bins[11].drivers;
+    assert_eq!(
+        (
+            &*drivers[0].message,
+            drivers[0].previous_count,
+            drivers[0].count
+        ),
+        ("request {id} failed", Some(1), 4)
+    );
+    assert_eq!(drivers[2].message, "request {{id}} failed");
+    let peer = &spike.peer.as_ref().unwrap().bins[11].drivers[0];
+    assert_eq!(
+        (&*peer.message, peer.previous_count),
+        ("job {id} done", Some(1))
+    );
+    state.move_spike(-1);
+    assert_eq!(
+        state.spike().unwrap().bins[10].drivers[0].message,
+        "request {id} failed"
+    );
+    state.move_spike(1);
+    state.follow_message(0).unwrap();
+    for (cursor, message) in [
+        ("1", "request 183 failed"),
+        ("2", "request 942 failed"),
+        ("3", "request 942 failed"),
+        ("4", "request 530 failed"),
+    ] {
+        let occurrence = state.spike().unwrap().occurrence().unwrap();
+        assert_eq!(
+            (
+                occurrence.event.cursor.as_deref(),
+                occurrence.event.message.as_str()
+            ),
+            (Some(cursor), message)
+        );
+        state.move_occurrence(1);
+    }
+    state.leave_message();
+    state.toggle_message_patterns();
+    assert_eq!(
+        state.spike().unwrap().bins[11].drivers[0].message,
+        "request 942 failed"
+    );
+    state.toggle_message_patterns();
+    state.follow_message(0).unwrap();
+    state.move_occurrence(2);
+    state.jump_to_spike().unwrap();
+    assert_eq!(state.spike_hit().unwrap().cursor.as_deref(), Some("3"));
+    assert!(state.spike_hit_hidden());
+}

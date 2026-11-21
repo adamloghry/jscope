@@ -277,6 +277,7 @@ impl Controls {
             KeyCode::Char('c') if following => {
                 self.notice = state.open_context().err().map(String::from);
             }
+            KeyCode::Char('t') if !following => state.toggle_message_patterns(),
             KeyCode::Left if following => state.move_occurrence(-1),
             KeyCode::Right if following => state.move_occurrence(1),
             KeyCode::PageUp if following => state.scroll_details(-6, self.detail_scroll_limit),

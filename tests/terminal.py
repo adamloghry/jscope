@@ -343,6 +343,27 @@ def test_cross_service_context(binary, fixture):
         wait_for("9/2/7", absent=("outside filters", "Polling job queue"))
 
 
+def test_message_patterns(binary):
+    command = [binary, "--input", "-", "--no-color"]
+    with terminal(command, columns=80, lines=24, piped=True) as (scope, keys, wait_for):
+        for req in ("183", "942"):
+            scope.stdin.write(journal_record("api.service", 4, f"request {req} timed out", cursor=req).encode())
+        scope.stdin.flush()
+        wait_for("2/min", "request 942 timed out")
+        keys(b"\t\r")
+        wait_for("Top messages", "t patterns")
+        keys(b"t")
+        wait_for("Top patterns", "?→2/2 · request {id} timed out", "t exact")
+        keys(b"1")
+        wait_for("Occurrence 1/2", "request 183 timed out", "Cursor 183")
+        keys(b"\x1b[C")
+        wait_for("Occurrence 2/2", "request 942 timed out", "Cursor 942")
+        keys(b"\x1b")
+        wait_for("Top patterns")
+        keys(b"t")
+        wait_for("Top messages", "1/2 · request 183 timed out")
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
@@ -352,3 +373,4 @@ if __name__ == "__main__":
     test_tail_spike_hops(sys.argv[1])
     test_follow_ranked_message(sys.argv[1], sys.argv[2])
     test_cross_service_context(sys.argv[1], sys.argv[2])
+    test_message_patterns(sys.argv[1])

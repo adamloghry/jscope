@@ -38,6 +38,8 @@ Use **←/→** to select a bar. The preview shows the first error-or-higher ent
 
 **Top messages** ranks the three most frequent messages in the selected service and interval. A row such as `1→6/9 · Polling job queue` means that exact text occurred once in the previous five seconds and six times among the selected interval's nine arrivals. The lookup includes every message in the preceding interval, even one that fell outside its top three. A `?` before the arrow means the earlier interval predates startup or overlaps missing intake history. An observed interval with no matches shows `0`. Repeats count individually across priorities and hosts. Search, solo and mute leave these counts intact. Ties sort by message text. The breakdown stays frozen as you scrub.
 
+Press **t** to rank **Top patterns**. For example, `request 183 timed out` and `request 942 timed out` count toward `request {id} timed out`. Decimal IDs must follow a label (`id`, `request`, `request_id`, `request-id`, `job`, `task`, or `pid`, case-insensitive) separated by spaces, `:`, `=`, or `#`. Standalone hyphenated UUIDs appear as `{uuid}`. Other text, including status codes, path components and versions, stays exact. Literal braces double in pattern labels. Each pattern compares against the same pattern in the preceding interval. **1–3** opens the original messages and their cursors. Press **t** again for the exact ranking from the same captured minute.
+
 ### Follow a ranked message
 
 In the spike inspector, **1**, **2** or **3** opens that ranked message from the active service and five-second interval. **←/→** steps through its retained occurrences in intake order. Each shows its own local time, journal timestamp in microseconds, host, priority and cursor, including occurrences folded into the same tail row. **PgUp/PgDn** scrolls long fields. **Esc** returns to the same graph and interval. **Enter** lands on the exact occurrence in the tail, temporarily revealing it if filtered out.
@@ -101,6 +103,7 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | Tab | Switch focus between tail and services |
 | ↑ / ↓ | Select a group or a service |
 | Enter | In the tail, expand or close details. In services, inspect the unit's graph. In the inspector, jump to the selected interval |
+| t in the inspector | Toggle ranked message patterns and exact messages |
 | 1 / 2 / 3 in the inspector | Follow that ranked message in the selected service and interval |
 | ← / → while following a message | Move to the previous or next exact occurrence. Enter jumps to the tail, Esc goes back to the graph |
 | c | Open a ±2-second cross-service context window from the tail or occurrence browser. Esc returns |

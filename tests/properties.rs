@@ -841,3 +841,62 @@ fn recovery_matches_a_known_rate_step_with_steady_background(tc: TestCase) {
     state.advance((confirmed + 30) * 1_000);
     assert_eq!(state.recovery(unit), None);
 }
+
+#[hegel::test(test_cases = 100)]
+fn pattern_counts_and_originals_match_the_ungrouped_messages(tc: TestCase) {
+    let mut state = State::default();
+    let mut previous = BTreeMap::new();
+    let mut current: BTreeMap<&str, Vec<Event>> = BTreeMap::new();
+    for at in [6_000, 11_000] {
+        let inputs = tc.draw(
+            gs::vecs(hegel::tuples!(
+                gs::integers::<u8>().max_value(4),
+                gs::integers::<u16>()
+            ))
+            .min_size(1)
+            .max_size(50),
+        );
+        for (i, (kind, id)) in inputs.into_iter().enumerate() {
+            let (message, expected) = match kind {
+                0 => (format!("request {id} failed"), "request {id} failed"),
+                1 => (format!("PID={id} quit"), "PID={id} quit"),
+                2 => ("status 404".into(), "status 404"),
+                3 => ("request {id} failed".into(), "request {{id}} failed"),
+                _ => ("status 503".into(), "status 503"),
+            };
+            let event = Event {
+                realtime_us: Some(i as u64),
+                cursor: Some(format!("{at}-{i}")),
+                priority: Some(6),
+                host: None,
+                unit: UNITS[0].into(),
+                unit_metadata: Default::default(),
+                message,
+            };
+            state.ingest(event.clone(), at);
+            if at == 6_000 {
+                *previous.entry(expected).or_insert(0_u64) += 1;
+            } else {
+                current.entry(expected).or_default().push(event);
+            }
+        }
+    }
+    state.set_muted(true);
+    state.begin_spike();
+    state.advance(90_000);
+    state.toggle_message_patterns();
+    let drivers = &state.spike().unwrap().bins[11].drivers;
+    let mut ranked: Vec<_> = current.into_iter().collect();
+    ranked.sort_by_key(|(pattern, records)| (std::cmp::Reverse(records.len()), *pattern));
+    ranked.truncate(3);
+    assert_eq!(drivers.len(), ranked.len());
+    for (driver, (pattern, records)) in drivers.iter().zip(ranked) {
+        assert_eq!(driver.message, pattern);
+        assert_eq!(driver.count, records.len() as u64);
+        assert_eq!(
+            driver.previous_count,
+            Some(*previous.get(pattern).unwrap_or(&0))
+        );
+        assert!(driver.occurrences().eq(&records));
+    }
+}
