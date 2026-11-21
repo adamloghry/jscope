@@ -45,8 +45,20 @@
             cargoLock.lockFile = ./Cargo.lock;
             cargoBuildFlags = [ "--bin" "jscope" ];
             doCheck = false;
-            meta.mainProgram = "jscope";
+            postInstall = ''
+              install -Dm644 ${./LICENSE-MIT} "$out/share/licenses/jscope/LICENSE-MIT"
+              install -Dm644 ${./LICENSE-APACHE} "$out/share/licenses/jscope/LICENSE-APACHE"
+            '';
+            meta = {
+              mainProgram = "jscope";
+              description = "Find which systemd service just got noisy";
+              homepage = "https://16384.dev/journalscope";
+              license = [ lib.licenses.mit lib.licenses.asl20 ];
+            };
           };
+          demo = pkgs.writeShellScriptBin "jscope-demo" ''
+            exec ${lib.getExe binary} --no-defaults --input ${./fixtures/demo.jsonl} --mute-unit indexer.service "$@"
+          '';
           tests = binary.overrideAttrs (attrs: {
             pname = "jscope-tests";
             doCheck = true;
@@ -68,12 +80,17 @@
             program = lib.getExe binary;
             meta.description = "Watch the local systemd journal";
           };
+          apps.demo = {
+            type = "app";
+            program = lib.getExe demo;
+            meta.description = "Replay a synthetic queue spike in JournalScope";
+          };
           checks = {
             inherit tests;
             terminal = pkgs.runCommand "jscope-terminal"
               { nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyte ])) ]; }
               ''
-                python ${./tests/terminal.py} "${lib.getExe binary}" "${./fixtures/demo.jsonl}" "${./fixtures/generations.jsonl}"
+                python ${./tests/terminal.py} "${lib.getExe binary}" "${./fixtures/demo.jsonl}" "${./fixtures/generations.jsonl}" "${lib.getExe demo}"
                 touch "$out"
               '';
             fmt = pkgs.runCommand "jscope-fmt"

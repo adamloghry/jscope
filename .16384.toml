@@ -1,0 +1,9 @@
+[repo]
+name = "journalscope"
+desc = "A terminal dashboard for finding which systemd service just got noisy."
+pitch = "Follow a burst from its service graph to the exact journal entry, the services around it, or the package changes at a NixOS switch."
+default_branch = "trunk"
+
+[[link]]
+label = "GitHub mirror"
+url = "https://github.com/adamloghry/journalscope"

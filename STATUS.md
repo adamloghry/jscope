@@ -48,7 +48,16 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-37 | NixOS marker owner | verified | Structured journal format | Integrated flake check passed. Two-boot guest tested switch, rollback and marker navigation |
 | JS-38 | Integrator and VM owner | verified | JS-37 marker fields | Flake and PTY passed. Ordinary guest user saw hello removed on switch and restored on rollback |
 | JS-39 | Integrator | verified | Flake package and pins | Full flake and two-boot guest passed, including host-configured backlog and command-line overrides |
-| JS-40 | Integrator | active | JS-35–39 | Verify each commit, capture screenshots and prepare both publication targets |
+| JS-40 | Integrator, screenshot and forge owners | verified | JS-35–39 | Release preparation complete. Publish trunk to 16384.dev and its GitHub mirror when ready |
+
+### Release checks
+
+- The sandboxed x86_64-linux flake check passed for the release package, demo wrapper, rustfmt, strict Clippy and 90 Rust tests. These include eight Hegel properties, fifteen deterministic replays and three subprocess lifecycle tests. Packaged PTY checks followed a changing-ID pattern to the original receipt, opened its surrounding services, and exercised the shipped demo.
+- The NixOS module was exercised in a two-boot disposable guest. The probe observed the configured eight-entry backlog, explicit zero and ten-entry overrides, and the actual package change across a switch and rollback. All journal input was guest-generated.
+- The exact `nix run .#demo` README command passed in an 80×24 terminal. The service strip showed `indexer.service [muted]` with 9/2/7. Following its second poll into context reached cursor `demo-02`.
+- Three PNGs capture the running Rust binary in XTerm with synthetic input. At 146 arrivals per minute, the muted metrics service leads with 51 incoming, one visible and 50 suppressed. The inspector compares 25 checkout arrivals with eight PostgreSQL arrivals, and the context view locates the original timeout at `demo-0136`.
+- A local build with the 16384 forge rendered the README, checked its relative links and verified all three images byte-for-byte. The static Git export exposed the same trunk commit. The release has a dual MIT OR Apache-2.0 license, with both texts installed in the Nix package.
+- The default and demo apps, packages, dev shells and VM tests evaluated for both targets. Native aarch64-linux execution requires an ARM builder (JS-06). The GitHub workflow is prepared for both architectures. Hosted CI and public deployment await publication.
 
 ## Shared contract
 
@@ -74,7 +83,7 @@ Replay has no control records or timing directives. Tests advance the state cloc
 - Build Hegel's matching 0.51.6 native engine from locked crates inside the Nix sandbox. The pinned 0.52.7 frontend loads it via `HEGEL_C_LIB_DIR`.
 - Use QEMU software acceleration for the VM check when KVM is unavailable. The guest exercises the packaged app under a regular account with journal access.
 
-## Verification evidence
+## Verification evidence before JS-35
 
 - `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 77 Rust tests including six Hegel properties, thirteen replay tests, five retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
 - `nix build .#vm-test --no-link -L` passed on x86_64-linux in a disposable NixOS VM. It verified real journalctl follow, matching unit and priority filters, exclusion of archived records from a prior guest boot, zero and nonzero backlogs, SIGTERM shutdown, child reaping, and restored terminal settings. All logs used for the test were synthetic guest records.

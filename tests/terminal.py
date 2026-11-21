@@ -419,3 +419,7 @@ if __name__ == "__main__":
     test_message_patterns(sys.argv[1])
     test_generation_markers(sys.argv[1], sys.argv[3])
     test_closure_diff(sys.argv[1])
+    with terminal([sys.argv[4]], columns=80, lines=24) as (_, keys, wait):
+        wait("indexer.service", "9/2/7", "Job queue is backing up")
+        keys(b"\t\r1\x1b[Cc")
+        wait("Context ±2s", "2/11 · Cursor demo-02", "Backend latency above target")

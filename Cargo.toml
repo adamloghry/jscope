@@ -2,6 +2,11 @@
 name = "jscope"
 version = "0.1.0"
 edition = "2024"
+description = "Find which systemd service just got noisy in a live journal dashboard"
+license = "MIT OR Apache-2.0"
+homepage = "https://16384.dev/journalscope"
+repository = "https://git.16384.dev/journalscope.git"
+readme = "README.md"
 publish = false
 
 [dependencies]
