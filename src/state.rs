@@ -129,7 +129,7 @@ impl State {
             counters: Counters::default(),
             first_host: None,
             multiple_hosts: false,
-            muted: true,
+            muted: false,
             muted_units: BTreeSet::new(),
             solo: None,
             search: String::new(),
@@ -579,7 +579,6 @@ mod tests {
     #[test]
     fn unit_mute_filters_only_lower_priorities_and_leaves_intake_unchanged() {
         let mut state = State::default();
-        state.set_muted(false);
         state.ingest(event("api", 6, "polling", 1), 0);
         state.ingest(event("api", 4, "overload", 2), 0);
         let mut unknown = event("api", 6, "unknown level", 3);
@@ -634,10 +633,11 @@ mod tests {
         state.ingest(event("db", 3, "not connected", 3), 200);
         state.set_search("rEaDy");
         assert_eq!(state.activity()[0].incoming, 2);
+        assert_eq!(state.activity()[0].visible, 2);
+        assert_eq!(state.visible_rows().count(), 2);
+        state.toggle_mute();
         assert_eq!(state.activity()[0].visible, 1);
         assert_eq!(state.visible_rows().count(), 1);
-        state.toggle_mute();
-        assert_eq!(state.activity()[0].visible, 2);
         state.advance(60_100);
         assert_eq!(state.activity()[0].incoming, 1);
         assert_eq!(state.rows().len(), 3);

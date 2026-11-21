@@ -393,6 +393,7 @@ dependencies = [
  "rustix",
  "serde_json",
  "signal-hook",
+ "time",
  "unicode-width",
 ]
 

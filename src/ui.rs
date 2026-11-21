@@ -3,13 +3,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Status<'a> {
     pub source: &'a str,
+    pub ended: bool,
     pub notice: Option<&'a str>,
     pub malformed: u64,
     pub oversized: u64,
@@ -19,35 +20,60 @@ pub struct Status<'a> {
 
 pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_color: bool) -> usize {
     let area = frame.area();
-    let expanded = state.expanded_group();
+    let wide = area.width >= 104;
+    let expanded = state
+        .expanded_group()
+        .filter(|_| wide || !status.service_focus);
     let detail_height = expanded.map_or(0, |_| (area.height / 2).clamp(4, 12));
-    let counters = counter_line(state, status);
-    let counter_height = if counters.width() > usize::from(area.width) {
-        2
-    } else {
-        1
-    };
-    let notice_height = if status.notice.is_some() { 2 } else { 0 };
-    let [header, body, details, footer] = Layout::vertical([
-        Constraint::Length(1 + counter_height + notice_height),
-        Constraint::Min(4),
+    let summaries = state.sidebar_activity();
+    let diagnostics = diagnostic_line(state, status);
+    let width = usize::from(area.width);
+    let mut notices = Vec::new();
+    wrap_line(&diagnostics, width, &mut notices);
+    if let Some(message) = status.notice {
+        let max_lines = notices.len() + 2;
+        wrap_line(message, width, &mut notices);
+        notices.truncate(max_lines);
+    }
+    let [header, alerts, leader, body, details, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(notices.len() as u16),
+        Constraint::Length(u16::from(
+            !wide && !status.service_focus && !summaries.is_empty(),
+        )),
+        Constraint::Min(1),
         Constraint::Length(detail_height),
-        Constraint::Length(if area.width < 80 { 3 } else { 2 }),
+        Constraint::Length(1),
     ])
     .areas(area);
 
-    render_header(frame, header, state, status, counters, counter_height);
-    let [tail, activity] = if body.width >= 96 {
-        Layout::horizontal([Constraint::Min(30), Constraint::Length(30)]).areas(body)
+    render_header(frame, header, state, status, &summaries, no_color);
+    frame.render_widget(
+        Paragraph::new(notices.into_iter().map(Line::raw).collect::<Vec<_>>())
+            .style(colored(Color::LightYellow, no_color)),
+        alerts,
+    );
+    if !leader.is_empty()
+        && let Some(entry) = summaries.first()
+    {
+        render_leader(frame, leader, state, entry, no_color);
+    }
+    if wide {
+        let [tail, activity] = Layout::horizontal([
+            Constraint::Min(1),
+            Constraint::Length((area.width / 3).min(52)),
+        ])
+        .areas(body);
+        render_tail(frame, tail, state, status, no_color);
+        render_activity(frame, activity, state, status, &summaries, no_color);
+    } else if status.service_focus {
+        render_activity(frame, body, state, status, &summaries, no_color);
     } else {
-        let activity_height = (body.height / 3).max(4).min(body.height.saturating_sub(3));
-        Layout::vertical([Constraint::Min(3), Constraint::Length(activity_height)]).areas(body)
-    };
-    render_tail(frame, tail, state, status.service_focus, no_color);
-    render_activity(frame, activity, state, status.service_focus, no_color);
-    render_footer(frame, footer, state, status);
+        render_tail(frame, body, state, status, no_color);
+    }
+    render_footer(frame, footer, status, no_color);
     expanded.map_or(0, |group| {
-        render_details(frame, details, group, state.detail_scroll())
+        render_details(frame, details, group, state.detail_scroll(), no_color)
     })
 }
 
@@ -56,54 +82,169 @@ fn render_header(
     area: Rect,
     state: &State,
     status: &Status<'_>,
-    counter_line: String,
-    counter_height: u16,
+    activity: &[UnitActivity],
+    no_color: bool,
 ) {
-    let scrolling = if state.is_paused() { "Paused" } else { "Live" };
-    let [title, counters, notice] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(counter_height),
-        Constraint::Min(0),
-    ])
-    .areas(area);
-    let title_line = Line::from(vec![
+    let (mode, accent) = if state.is_paused() {
+        ("Ⅱ Paused", Color::LightYellow)
+    } else if status.ended {
+        ("◆", Color::LightBlue)
+    } else {
+        ("● Live", Color::LightGreen)
+    };
+    let title = Line::from(vec![
         Span::styled(
-            "JournalScope",
-            Style::default().add_modifier(Modifier::BOLD),
+            if area.width < 48 {
+                "jscope"
+            } else {
+                "JournalScope"
+            },
+            colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  {scrolling} · {}", status.source)),
+        Span::styled(format!("  {mode}"), colored(accent, no_color)),
+        Span::raw(format!(" {}", status.source)),
     ]);
-    frame.render_widget(Paragraph::new(title_line), title);
-    frame.render_widget(
-        Paragraph::new(counter_line).wrap(Wrap { trim: true }),
-        counters,
-    );
-    if let Some(text) = status.notice {
-        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), notice);
+    let title_width = title.width() as u16;
+    let [identity, metrics] =
+        Layout::horizontal([Constraint::Length(title_width), Constraint::Min(0)]).areas(area);
+    frame.render_widget(title, identity);
+    let mut bins = [0; SPARK_BINS];
+    let mut incoming = 0;
+    let mut visible = 0;
+    for entry in activity {
+        incoming += entry.incoming;
+        visible += entry.visible;
+        for (total, count) in bins.iter_mut().zip(entry.sparkline) {
+            *total += count;
+        }
+    }
+    let width = usize::from(metrics.width.saturating_sub(1));
+    let mut spans = Vec::new();
+    if incoming == 0 {
+        spans.push(Span::styled(
+            "Quiet · last 60s",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    } else {
+        let rate = format!("{incoming}/min");
+        let total = u128::from(incoming);
+        let percent = ((u128::from(visible) * 100 + total / 2) / total) as usize;
+        let share = format!(" {percent}% shown");
+        let meter_width = width.saturating_sub(rate.len() + share.len() + 4).min(8);
+        let graph_width = width
+            .saturating_sub(rate.len() + share.len() + meter_width + 4)
+            .min(SPARK_BINS);
+        if width >= rate.len() + share.len() + meter_width + graph_width + 10 {
+            spans.push(Span::styled(
+                "Intake ",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        if graph_width >= 3 {
+            spans.push(Span::styled(
+                sparkline(&bins, graph_width, None),
+                colored(Color::LightCyan, no_color),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            rate,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        if meter_width >= 3 {
+            let filled = (percent * meter_width + 50) / 100;
+            spans.extend([
+                Span::raw("  "),
+                Span::styled("▰".repeat(filled), colored(Color::LightGreen, no_color)),
+                Span::styled(
+                    "▱".repeat(meter_width - filled),
+                    colored(Color::DarkGray, no_color),
+                ),
+            ]);
+        }
+        if width >= spans.iter().map(Span::width).sum::<usize>() + share.len() {
+            spans.push(Span::raw(share));
+        }
+    }
+    frame.render_widget(Line::from(spans).right_aligned(), metrics);
+}
+
+fn diagnostic_line(state: &State, status: &Status<'_>) -> String {
+    let counts = state.counters();
+    let mut issues = Vec::new();
+    if status.malformed > 0 {
+        issues.push(format!("{} malformed", status.malformed));
+    }
+    if status.oversized > 0 {
+        issues.push(format!("{} oversized", status.oversized));
+    }
+    if counts.evicted_rows > 0 {
+        issues.push(format!(
+            "evicted {} rows/{} events",
+            counts.evicted_rows, counts.evicted_occurrences
+        ));
+    }
+    if counts.activity_dropped > 0 {
+        issues.push(format!("{} omitted from activity", counts.activity_dropped));
+    }
+    if issues.is_empty() {
+        String::new()
+    } else {
+        format!("! {}", issues.join(" · "))
     }
 }
 
-fn counter_line(state: &State, status: &Status<'_>) -> String {
-    let counts = state.counters();
-    format!(
-        "In {} · bad JSON {} · oversize {} · evicted {} rows/{} events · activity omitted {}",
-        counts.received,
-        status.malformed,
-        status.oversized,
-        counts.evicted_rows,
-        counts.evicted_occurrences,
-        counts.activity_dropped,
-    )
+fn filter_status(state: &State) -> String {
+    let mut flags = String::new();
+    if state.is_muted() {
+        flags.push_str(" · warning+");
+    }
+    if let Some(unit) = state.solo() {
+        flags.push_str(" · solo ");
+        flags.push_str(unit);
+    }
+    if !state.search().is_empty() {
+        flags.push_str(" · / ");
+        flags.push_str(state.search());
+    }
+    flags
+}
+
+fn section(title: String, focused: bool, no_color: bool) -> Block<'static> {
+    let accent = if focused {
+        Color::LightCyan
+    } else {
+        Color::DarkGray
+    };
+    Block::default()
+        .borders(Borders::TOP)
+        .border_style(colored(accent, no_color))
+        .title(Span::styled(
+            format!(" {title} "),
+            colored(
+                if focused {
+                    Color::LightCyan
+                } else {
+                    Color::Cyan
+                },
+                no_color,
+            )
+            .add_modifier(Modifier::BOLD),
+        ))
 }
 
 fn render_tail(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &State,
-    service_focus: bool,
+    status: &Status<'_>,
     no_color: bool,
 ) {
-    let block = panel("Journal · UTC", !service_focus);
+    let block = section(
+        format!("Journal · local{}", filter_status(state)),
+        !status.service_focus,
+        no_color,
+    );
     let content = block.inner(area);
     let mut lines = Vec::new();
     if let Some(selected) = state.selected_group() {
@@ -116,7 +257,7 @@ fn render_tail(
                 .map(|row| {
                     tail_line(
                         row,
-                        row.id == selected.id && state.is_paused() && !service_focus,
+                        row.id == selected.id && state.is_paused() && !status.service_focus,
                         state.show_hosts(),
                         content.width < 65,
                         no_color,
@@ -126,7 +267,22 @@ fn render_tail(
         );
         lines.reverse();
     } else {
-        lines.push(Line::from("No matching entries"));
+        let empty = if state.is_paused() && state.visible_rows().next().is_some() {
+            "Paused before the first entry · g to jump to live"
+        } else if state.rows().is_empty() && status.ended {
+            "Input ended without journal entries"
+        } else if state.rows().is_empty() {
+            "Waiting for journal entries…"
+        } else if !state.search().is_empty() {
+            "No entries match this search · / to edit"
+        } else if state.solo().is_some() {
+            "No visible entries for the soloed service · s to clear solo"
+        } else if state.is_muted() {
+            "Lower priorities are muted · m to show them"
+        } else {
+            "Service entries are muted · Tab to select a service, M to unmute"
+        };
+        lines.push(Line::from(empty));
     }
 
     frame.render_widget(block, area);
@@ -143,7 +299,7 @@ fn tail_line(
 ) -> Line<'_> {
     let event = &row.first;
     let (severity, severity_style) = severity(event.priority, no_color);
-    let first = time(event.realtime_us);
+    let first = crate::local_time::format(event.realtime_us);
     let stamp = if compact {
         first[..8].to_owned()
     } else {
@@ -174,7 +330,7 @@ fn tail_line(
     let message = truncate_display(&event.message, available.saturating_sub(unit.width()));
     let mut spans = vec![
         Span::raw(if selected { "› " } else { "  " }),
-        Span::raw(stamp),
+        Span::styled(stamp, Style::default().add_modifier(Modifier::DIM)),
         Span::raw(repeat),
     ];
     if show_host {
@@ -223,76 +379,159 @@ fn truncate_display(text: &str, width: usize) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+fn unit_tags(state: &State, unit: &str) -> String {
+    let mut tags = String::new();
+    if state.solo() == Some(unit) {
+        tags.push_str(" [solo]");
+    }
+    if state.is_unit_muted(unit) {
+        tags.push_str(" [muted]");
+    }
+    tags
+}
+
+fn render_leader(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    entry: &UnitActivity,
+    no_color: bool,
+) {
+    let label = "↑ Noisiest ";
+    let legend = if area.width >= 72 { " in/vis/supp" } else { "" };
+    let width = usize::from(area.width).saturating_sub(label.width() + legend.len());
+    let line = if entry.incoming == 0 {
+        Line::from("Activity · quiet over the last 60s")
+    } else {
+        let mut spans = vec![Span::styled(label, colored(Color::LightCyan, no_color))];
+        spans.extend(activity_spans(state, entry, width, None, no_color));
+        spans.push(Span::styled(
+            legend,
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        Line::from(spans)
+    };
+    frame.render_widget(line, area);
+}
+
 fn render_activity(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &State,
-    service_focus: bool,
+    status: &Status<'_>,
+    summaries: &[UnitActivity],
     no_color: bool,
 ) {
-    let block = panel("Activity · 60s", service_focus);
+    let title = if status.service_focus {
+        format!("Services · 60s{}", filter_status(state))
+    } else {
+        "Services · 60s".to_owned()
+    };
+    let block = section(title, status.service_focus, no_color);
     let content = block.inner(area);
-    let summaries = state.sidebar_activity();
-    let selected_index = state.sidebar_index(&summaries);
-    let width = usize::from(content.width);
-    let capacity = usize::from(content.height / 2);
-    let start = (selected_index + 1).saturating_sub(capacity);
-    let mut lines = Vec::new();
-
-    for (index, entry) in summaries.iter().enumerate().skip(start).take(capacity) {
-        let selected = index == selected_index;
-        let marker = if selected && service_focus {
-            "› "
-        } else {
-            "  "
-        };
-        let solo = if state.solo() == Some(entry.unit.as_str()) {
-            " [solo]"
-        } else {
-            ""
-        };
-        let muted = if state.is_unit_muted(&entry.unit) {
-            " [muted]"
-        } else {
-            ""
-        };
-        let unit_width = width.saturating_sub(marker.width() + solo.len() + muted.len());
-        let label = vec![
-            Span::raw(marker),
-            Span::styled(
-                truncate_display(&entry.unit, unit_width),
-                unit_style(&entry.unit, no_color),
-            ),
-            Span::raw(solo),
-            Span::raw(muted),
-        ];
-        lines.push(Line::from(label));
-        lines.push(Line::from(activity_counts(entry, width)));
-    }
-
-    if summaries.is_empty() {
-        lines.push(Line::from("Waiting for intake"));
-    }
-
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), content);
+    let [legend, list] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    frame.render_widget(Line::styled("  unit", dim), legend);
+    frame.render_widget(
+        Line::styled("in/visible/suppressed", dim).right_aligned(),
+        legend,
+    );
+    let width = usize::from(list.width.saturating_sub(2));
+    let bars = trend_width(width);
+    let peak = summaries
+        .iter()
+        .flat_map(|entry| buckets(&entry.sparkline, bars))
+        .max();
+    let selected_index = state.sidebar_index(summaries);
+    let capacity = usize::from(list.height);
+    let start = if status.service_focus {
+        (selected_index + 1).saturating_sub(capacity)
+    } else {
+        0
+    };
+    let mut lines = Vec::new();
+    for (index, entry) in summaries.iter().enumerate().skip(start).take(capacity) {
+        let selected = index == selected_index && status.service_focus;
+        let mut spans = vec![Span::raw(if selected { "› " } else { "  " })];
+        spans.extend(activity_spans(state, entry, width, peak, no_color));
+        let line = Line::from(spans);
+        lines.push(if selected {
+            line.style(Style::default().add_modifier(Modifier::REVERSED))
+        } else {
+            line
+        });
+    }
+    if summaries.is_empty() {
+        lines.push(Line::from("No intake in the last 60s"));
+    }
+    frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn render_details(frame: &mut Frame<'_>, area: Rect, group: &Group, scroll: usize) -> usize {
+fn activity_spans<'a>(
+    state: &State,
+    entry: &'a UnitActivity,
+    width: usize,
+    peak: Option<u64>,
+    no_color: bool,
+) -> Vec<Span<'a>> {
+    let tags = unit_tags(state, &entry.unit);
+    let mut counts = format!("{}/{}/{}", entry.incoming, entry.visible, entry.suppressed);
+    if counts.len() + 10 + tags.width() > width {
+        counts = format!(
+            "{}/{}/{}",
+            compact_count(entry.incoming),
+            compact_count(entry.visible),
+            compact_count(entry.suppressed)
+        );
+    }
+    let available = width.saturating_sub(tags.width() + counts.width() + 2);
+    let bars = trend_width(width);
+    let bars = if available >= bars + 4 { bars } else { 0 };
+    let unit_width = available.saturating_sub(bars);
+    let unit = truncate_display(&entry.unit, unit_width);
+    let padding = unit_width.saturating_sub(unit.width());
+    vec![
+        Span::styled(unit, unit_style(&entry.unit, no_color)),
+        Span::styled(tags, colored(Color::LightYellow, no_color)),
+        Span::raw(" ".repeat(padding + 1)),
+        Span::styled(
+            sparkline(&entry.sparkline, bars, peak),
+            unit_style(&entry.unit, no_color),
+        ),
+        Span::raw(format!(" {counts}")),
+    ]
+}
+
+fn render_details(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    group: &Group,
+    scroll: usize,
+    no_color: bool,
+) -> usize {
     let entry = &group.last;
     let host = entry.host.as_deref().unwrap_or("(unknown)");
     let cursor = entry.cursor.as_deref().unwrap_or("(missing)");
     let priority = severity(entry.priority, true).0;
     let mut fields = vec![format!(
-        "{} · host {host} · {priority} · {} occurrences",
-        entry.unit, group.count
+        "{} · host {host} · {priority} · {} {}",
+        entry.unit,
+        group.count,
+        if group.count == 1 {
+            "occurrence"
+        } else {
+            "occurrences"
+        }
     )];
     let realtime = |timestamp: Option<u64>| {
         timestamp.map_or_else(|| "(missing)".to_owned(), |us| us.to_string())
     };
     if group.count == 1 {
         fields.push(format!(
-            "Journal realtime µs {}",
+            "Local {} · Journal realtime µs {}",
+            crate::local_time::format(entry.realtime_us),
             realtime(entry.realtime_us)
         ));
     } else {
@@ -312,7 +551,7 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, group: &Group, scroll: usiz
         let times = group
             .recent_times()
             .iter()
-            .map(|timestamp| time(*timestamp))
+            .map(|timestamp| crate::local_time::format(*timestamp))
             .collect::<Vec<_>>()
             .join("  ");
         let omitted = group.count - group.recent_times().len() as u64;
@@ -321,15 +560,15 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, group: &Group, scroll: usiz
         } else {
             String::new()
         };
-        fields.push(format!("Recent UTC  {times}{earlier}"));
+        fields.push(format!("Recent local  {times}{earlier}"));
     }
     fields.push(format!("Message  {}", entry.message));
 
-    let block = panel("Details · PgUp/PgDn scroll", false);
+    let block = section("Details · PgUp/PgDn scroll".into(), false, no_color);
     let content = block.inner(area);
     let mut lines = Vec::new();
     for field in &fields {
-        wrap_detail_line(field, usize::from(content.width), &mut lines);
+        wrap_line(field, usize::from(content.width), &mut lines);
     }
     let height = usize::from(content.height);
     let limit = lines.len().saturating_sub(height);
@@ -344,11 +583,11 @@ fn render_details(frame: &mut Frame<'_>, area: Rect, group: &Group, scroll: usiz
     limit
 }
 
-fn wrap_detail_line<'a>(text: &'a str, width: usize, lines: &mut Vec<&'a str>) {
-    if width == 0 {
+fn wrap_line<'a>(text: &'a str, width: usize, lines: &mut Vec<&'a str>) {
+    if width == 0 || text.is_empty() {
         return;
     }
-    // Details are composed from already escaped fields and contain no newlines.
+    // Details and source diagnostics have already had control characters escaped.
     if text.is_ascii() {
         lines.extend(
             (0..text.len())
@@ -373,59 +612,54 @@ fn wrap_detail_line<'a>(text: &'a str, width: usize, lines: &mut Vec<&'a str>) {
     lines.push(&text[start..]);
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &State, status: &Status<'_>) {
-    let mute = if state.is_muted() {
-        "warning+"
+fn render_footer(frame: &mut Frame<'_>, area: Rect, status: &Status<'_>, no_color: bool) {
+    if let Some(query) = status.search_input {
+        let hint = if area.width >= 40 {
+            "  Enter apply · Esc cancel"
+        } else {
+            ""
+        };
+        let [input, keys] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(hint.width() as u16)])
+                .areas(area);
+        let query = format!("/ {query}▏");
+        let offset = query.width().saturating_sub(usize::from(input.width)) as u16;
+        frame.render_widget(Paragraph::new(query).scroll((0, offset)), input);
+        frame.render_widget(Line::raw(hint), keys);
+        return;
+    }
+    let mut spans = Vec::new();
+    let pane = if status.service_focus {
+        "journal"
     } else {
-        "all priorities"
+        "services"
     };
-    let query = match status.search_input {
-        Some(editing) => format!("/ {editing}▏  Enter apply  Esc cancel"),
-        None => {
-            let search = if state.search().is_empty() {
-                String::new()
-            } else {
-                format!(" · / {}", state.search())
-            };
-            let solo = state
-                .solo()
-                .map_or(String::new(), |unit| format!(" · solo {unit}"));
-            format!("Activity in/visible/suppressed · {mute}{solo}{search}")
+    let separator = if area.width >= 88 { "  " } else { " " };
+    let keys = [
+        ("q", "quit"),
+        ("Tab", pane),
+        ("↑↓", "move"),
+        ("↵", "view"),
+        ("s", "solo"),
+        ("m/M", "mute"),
+        ("/", "find"),
+        ("Space", "pause"),
+        ("g", "live"),
+    ];
+    let mut remaining = usize::from(area.width);
+    for (key, action) in keys {
+        let width = key.width() + 1 + action.width();
+        if width > remaining {
+            break;
         }
-    };
-    let keys = "q quit  Tab pane  ↑↓ move  ↵ view  s solo  m/M mute  / find  Space pause  g live";
-    let [filters, shortcuts] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
-    let offset = if status.search_input.is_some() {
-        query.width().saturating_sub(usize::from(filters.width)) as u16
-    } else {
-        0
-    };
-    frame.render_widget(Paragraph::new(query).scroll((0, offset)), filters);
-    frame.render_widget(Paragraph::new(keys).wrap(Wrap { trim: true }), shortcuts);
-}
-
-fn panel(title: &'static str, focused: bool) -> Block<'static> {
-    let style = if focused {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(title, style))
-}
-
-fn time(realtime_us: Option<u64>) -> String {
-    let Some(us) = realtime_us else {
-        return "--:--:--.---".to_owned();
-    };
-    let ms = us / 1_000;
-    let hour = ms / 3_600_000 % 24;
-    let min = ms / 60_000 % 60;
-    let sec = ms / 1_000 % 60;
-    let fraction = ms % 1_000;
-    format!("{hour:02}:{min:02}:{sec:02}.{fraction:03}")
+        spans.push(Span::styled(
+            key,
+            colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(format!(" {action}{separator}")));
+        remaining = remaining.saturating_sub(width + separator.len());
+    }
+    frame.render_widget(Line::from(spans), area);
 }
 
 fn elapsed(first: Option<u64>, last: Option<u64>) -> String {
@@ -443,23 +677,6 @@ fn elapsed(first: Option<u64>, last: Option<u64>) -> String {
     }
 }
 
-fn activity_counts(entry: &UnitActivity, width: usize) -> String {
-    let mut counts = format!("{}/{}/{}", entry.incoming, entry.visible, entry.suppressed);
-    if counts.len() + 8 > width {
-        counts = format!(
-            "{}/{}/{}",
-            compact_count(entry.incoming),
-            compact_count(entry.visible),
-            compact_count(entry.suppressed),
-        );
-    }
-    let bars = width.saturating_sub(counts.len() + 4).min(SPARK_BINS);
-    if bars == 0 {
-        return counts;
-    }
-    format!("  {}  {counts}", sparkline(entry, bars))
-}
-
 fn compact_count(mut count: u64) -> String {
     let mut scale = "";
     for suffix in ["k", "M", "G", "T", "P", "E"] {
@@ -472,18 +689,26 @@ fn compact_count(mut count: u64) -> String {
     format!("{count}{scale}")
 }
 
-fn sparkline(entry: &UnitActivity, bars: usize) -> String {
+fn trend_width(width: usize) -> usize {
+    if width >= 48 {
+        SPARK_BINS
+    } else {
+        SPARK_BINS / 2
+    }
+}
+
+fn buckets(bins: &[u64; SPARK_BINS], bars: usize) -> impl Iterator<Item = u64> + '_ {
+    (0..bars).map(move |i| {
+        bins[i * SPARK_BINS / bars..(i + 1) * SPARK_BINS / bars]
+            .iter()
+            .sum()
+    })
+}
+
+fn sparkline(bins: &[u64; SPARK_BINS], bars: usize, peak: Option<u64>) -> String {
     const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let counts = (0..bars)
-        .map(|index| {
-            entry.sparkline[index * SPARK_BINS / bars..(index + 1) * SPARK_BINS / bars]
-                .iter()
-                .sum::<u64>()
-        })
-        .collect::<Vec<_>>();
-    let max = counts.iter().copied().max().unwrap_or(0);
-    counts
-        .into_iter()
+    let max = peak.unwrap_or_else(|| buckets(bins, bars).max().unwrap_or(0));
+    buckets(bins, bars)
         .map(|count| {
             if count == 0 {
                 '·'
@@ -554,11 +779,81 @@ mod tests {
         }
     }
 
+    fn screen(width: u16, height: u16, state: &State, status: &Status<'_>) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, state, status, true);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn header_tracks_the_rolling_window_and_sidebar_trends_share_a_scale() {
+        let mut state = State::default();
+        for _ in 0..8 {
+            state.ingest(event("burst", 6, 0), 0);
+        }
+        let mut other = event("alarm", 4, 0);
+        other.unit = "other.service".into();
+        state.ingest(other, 55_000);
+        state.toggle_mute();
+        let status = Status {
+            source: "journalctl",
+            ..Default::default()
+        };
+        let view = screen(144, 24, &state, &status);
+        assert!(view[0].contains("█··········▁ 9/min"), "{}", view[0]);
+        assert!(view[0].contains("▰▱▱▱▱▱▱▱ 11% shown"), "{}", view[0]);
+        // The older burst and the single fresh event should have different heights.
+        assert!(
+            view.iter()
+                .any(|row| row.contains('█') && row.contains("8/0/8"))
+        );
+        assert!(
+            view.iter()
+                .any(|row| row.contains('▁') && row.contains("1/1/0"))
+        );
+        state.advance(60_000);
+        let view = screen(80, 24, &state, &status);
+        assert!(view[0].contains("1/min") && view[0].contains("100% shown"));
+        state.advance(115_000);
+        let view = screen(80, 24, &state, &status);
+        assert!(view[0].contains("Quiet"));
+        assert!(view.iter().any(|row| row.contains("WARN alarm")));
+    }
+
+    #[test]
+    fn explains_empty_sources_frozen_tails_and_filtered_rows() {
+        let mut state = State::default();
+        let mut status = Status::default();
+        let display = |state: &State, status: &Status<'_>| screen(80, 12, state, status).join("\n");
+        assert!(display(&state, &status).contains("Waiting for journal entries"));
+        status.ended = true;
+        assert!(display(&state, &status).contains("Input ended without journal entries"));
+        state.set_paused(true);
+        state.ingest(event("background task", 6, 0), 0);
+        assert!(display(&state, &status).contains("g to jump to live"));
+        state.jump_live();
+        state.toggle_mute();
+        assert!(display(&state, &status).contains("m to show them"));
+        state.set_search("unseen");
+        assert!(display(&state, &status).contains("/ to edit"));
+    }
+
     #[test]
     fn muted_noise_stays_in_sidebar_and_warning_stays_in_tail() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = State::default();
+        state.set_muted(true);
         for timestamp in 0..5 {
             state.ingest(event("quietly repeated", 6, timestamp), 0);
         }

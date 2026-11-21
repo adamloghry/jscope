@@ -12,7 +12,6 @@ fn synthetic_replay_shows_the_noisy_muted_unit_and_its_warning() {
     let bytes = include_bytes!("../fixtures/demo.jsonl");
     let mut decoder = Decoder::new(BufReader::new(&bytes[..]), MAX_LINE_BYTES);
     let mut state = State::default();
-    state.set_muted(false);
     state.set_unit_muted("indexer.service", true).unwrap();
 
     let mut at = 0;

@@ -92,6 +92,7 @@ fn large_repeat_groups_share_intake_and_keep_occurrence_counts_after_tail_evicti
 #[test]
 fn repeat_boundaries_include_hidden_entries_hosts_units_levels_and_messages() {
     let mut state = State::default();
+    state.set_muted(true);
     let records = [
         ("one", "local", 4, "same"),
         ("one", "local", 4, "same"),

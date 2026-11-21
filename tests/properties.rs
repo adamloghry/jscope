@@ -196,7 +196,7 @@ impl Model {
             events: Vec::new(),
             row_limit,
             now: 0,
-            muted: true,
+            muted: false,
             muted_units: [false; UNITS.len()],
             solo: None,
             query: "",
@@ -404,12 +404,13 @@ fn burst_and_view_actions_match_a_full_history_model(tc: TestCase) {
 }
 
 #[hegel::test(test_cases = 100)]
-fn unique_bursts_stay_bounded_without_losing_default_warnings(tc: TestCase) {
+fn unique_bursts_stay_bounded_without_losing_warnings_when_muted(tc: TestCase) {
     let rows = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
     let activity = tc.draw(gs::integers::<usize>().min_value(1).max_value(20));
     let extra = tc.draw(gs::integers::<usize>().min_value(1).max_value(200));
     let count = rows.max(activity) + extra;
     let mut state = State::new(rows, activity);
+    state.set_muted(true);
     for index in 0..count {
         state.ingest(
             Event {

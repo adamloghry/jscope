@@ -15,12 +15,16 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-09 | State/UI owner, service controls and rendering | verified | JS-03 | None |
 | JS-10 | Verification owner, terminal and VM tests | verified | JS-04 | None on x86_64-linux |
 | JS-11 | Integrator, intake loop, CLI, docs and check-in | verified | JS-08–10 | None |
+| JS-12 | State owner, startup visibility and model tests | verified | JS-03 | None |
+| JS-13 | Time owner, local timestamp formatting | verified | JS-02 | None |
+| JS-14 | Terminal-test owner, packaged interaction tests | verified | JS-12, JS-13 | None |
+| JS-15 | Integrator, dashboard layout, docs and verification | verified | JS-12–14 | None on x86_64-linux |
 
 ## Shared contract
 
 Live input and replay fixtures are journalctl JSON, one object per line, with journal field names. Invalid lines can appear in regression fixtures. `journal::Event` stores optional journal realtime in microseconds, cursor, priority (0–7), and host, plus resolved unit, its journal source and other usable identity fields, and the sanitized message. The unit fallback starts with `_SYSTEMD_USER_UNIT`, followed by `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, `_COMM`, and `(unknown)`. Duplicate fields use the first usable value. Journal byte arrays preserve valid UTF-8 and escape invalid bytes. Reader outcomes distinguish malformed and oversized lines, EOF, and source errors.
 
-State receives monotonic intake times as milliseconds. The rolling window includes ages below 60 seconds. History retains journal timestamps. Adjacent valid events collapse by host, unit, priority, and message. The default display shows warnings and higher plus entries with unknown priority. Display controls act independently of intake. The UI shows incoming, visible, and suppressed occurrences, and reports any retention omissions.
+State receives monotonic intake times as milliseconds. The rolling window includes ages below 60 seconds. History retains journal timestamps. Adjacent valid events collapse by host, unit, priority, and message. The default display shows every priority. Global and per-service muting retain warnings, higher severities, and unknown priorities. Display controls act independently of intake. The UI shows incoming, visible, and suppressed occurrences, and reports any retention omissions.
 
 Replay has no control records or timing directives. Tests advance the state clock independently of journal timestamps. In the demo, `indexer.service` leads the first 60 seconds with 9 incoming, 2 visible, and 7 suppressed occurrences. Its paired warnings appear as one group.
 
@@ -32,12 +36,15 @@ Replay has no control records or timing directives. Tests advance the state cloc
 
 ## Verification evidence
 
-- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 29 Rust tests including three Hegel properties, three replay tests, three retention regressions, and three subprocess tests. Cargo built offline. A separate PTY check ran the packaged app with stdin connected to an open journal pipe, drove pause, search, jump to live, service mute and quit, and verified terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
+- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 34 Rust tests including three Hegel properties, three replay tests, three retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
 - `nix build .#vm-test --no-link -L` passed on x86_64-linux in a disposable NixOS VM. It verified real journalctl follow, matching unit and priority filters, exclusion of archived records from a prior guest boot, zero and nonzero backlogs, SIGTERM shutdown, child reaping, and restored terminal settings. All logs used for the test were synthetic guest records.
 - The exact README replay command passed in an 80×24 pseudo-terminal. File and piped replay also passed direct PTY smoke tests, including details, unmute, clean quit, and terminal restoration with the pipe still open. `nix run . -- --help` verified the default app entry point.
 - `nix flake check --all-systems --no-build` evaluated package, app, dev shell, standard checks, and VM check for x86_64-linux and aarch64-linux. The environment exposes x86_64 builders only, so aarch64-linux build and runtime tests remain open.
 
 ## Release audit
+
+- With a full synthetic backlog, the updated layout shows 20 log rows at 80×24 (previously 12) and 27 at 140×30 (previously 24). At 80 columns the busiest service occupies one line. Tab opens the full ranking. Wider terminals show the ranking next to the tail, using a shared vertical scale across service graphs.
+- In the packaged live PTY regression, 31 info entries and one warning produced 32/min and 100% shown. Global mute preserved the warning and rate while the meter fell to 3%. The same test verified the event's local clock time under `TZ=JST-9`. Separate tests cover historical offsets on both sides of the spring and fall DST transitions, rolling graph expiry, and empty or paused views.
 
 - The parser previously discarded the origin of the displayed service name and its remaining identity fields. These fields are now retained, with their allocations included in the history budget. A fixture also covers an invalid byte array that previously supplied a spurious priority.
 - The baseline release needed 14.915 seconds to show the final warning of a 12,001-record synthetic replay through a pseudo-terminal. The main loop waited on keyboard input while replay records queued. The revised loop waits on the source and schedules terminal draws independently. The new Nix release binary displayed the final warning in 0.052 seconds using the same input and PTY on this machine. These are single-run measurements.

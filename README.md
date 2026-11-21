@@ -16,7 +16,11 @@ nix run . -- --backlog 50 --boot --unit sshd.service --priority debug
 
 Use `--unit` for system services or `--user-unit` for user services. Both options may be repeated. `--boot` selects the current boot, and accepts a boot ID or offset such as `--boot=-1`. `--priority` accepts journalctl names, numbers, or inclusive ranges. A single level includes all higher severities. Live mode passes these options directly to journalctl. With file or stdin replay, apply native selectors to the journalctl command that produces the JSON. [journalctl manual](https://www.freedesktop.org/software/systemd/man/latest/journalctl.html)
 
-**The activity panel counts only events journalctl sends, before JournalScope's display filters.** The incoming count and sparkline use the last 60 seconds of intake, including the startup backlog as it arrives. Visible and suppressed split those occurrences using the current display filters, independently of scrolling, repeat collapse, and tail eviction. Lower-severity muting starts enabled. Warning and higher levels, and entries with unknown priority, pass that mute.
+**The tail starts with all priorities visible.** Press `m` to mute entries below warning across all services, or select a service and press `Shift+M` to mute just that service. Warnings, higher severities, and entries with unknown priority pass either mute.
+
+**The dashboard counts only events journalctl sends, before JournalScope's display filters.** The header graph shows the last minute of intake, oldest on the left. At full width each column covers five seconds. The number beside it counts arrivals over that minute, including the startup backlog as it arrives. The segmented meter shows the percentage of those occurrences that pass the current display filters. Repeats count individually, even while the tail is paused.
+
+The service list ranks units by incoming activity. The service graphs share a scale so you can compare bursts across rows. Each row shows its trend and three counts in the order incoming / visible / suppressed. On a narrow terminal, the busiest service stays above the full-width tail. Press Tab for the complete ranking or to return to the log. At 104 columns and wider, the ranking stays beside the log.
 
 ## Try a synthetic replay
 
@@ -26,9 +30,9 @@ nix run . -- --input fixtures/demo.jsonl --mute-unit indexer.service
 
 For the first 60 seconds, `indexer.service` leads with nine incoming entries, two visible, and seven suppressed. Its two warnings collapse into one row. The notice from `proxy.service` also stays visible. Press Enter to inspect the repeated warning. Press Tab to focus services and Shift+M to unmute the indexer.
 
-Each `--mute-unit NAME` selects an exact unit name for lower-severity muting at startup. Supplying any of these options starts with other units visible at all priorities. A service mute stays in effect when you toggle global mute with `m`. The same controls work with live, file, and piped input.
+Each `--mute-unit NAME` selects an exact unit name for lower-severity muting at startup. A service mute stays in effect when you toggle global mute with `m`. The same controls work with live, file, and piped input.
 
-Replay reads the same one-object-per-line JSON as live mode, as quickly as input arrives. The activity window follows receipt time and the tail shows UTC journal timestamps. The tail stays available after the replay finishes. For an SSH stream, run this from a local terminal.
+Replay reads the same one-object-per-line JSON as live mode, as quickly as input arrives. The activity window follows receipt time. The tail and repeat details show journal timestamps in the viewer's local time zone, using the offset in effect at the time of each event. The tail stays available after the replay finishes. For an SSH stream, run this from a local terminal.
 
 ```sh
 ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . -- --input -
@@ -52,7 +56,7 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 
 For the name in the tail and activity panel, JournalScope prefers `_SYSTEMD_USER_UNIT`, followed by `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, and `_COMM`. Entries without any of these share the `(unknown)` bucket. The reader uses the first usable value for each field and escapes control characters and invalid bytes for display. Expanded details identify the journal fields that supplied the unit names. All dashboard history and mute settings live in memory for the current session.
 
-Use `--no-color` for an uncolored display. Adjacent valid entries with the same host, resolved unit, priority, and message collapse into a group with an occurrence count and journal time span. The status line reports malformed and oversized input, tail eviction, early activity omissions, and source diagnostics. The tail holds up to 2,000 groups, and activity holds up to 16,384 intake entries, with a separate 12 MiB text budget for each. If the activity buffer reaches a limit before entries expire, its counts reflect the retained window. Journal lines over 64 KiB are discarded before their complete contents can be buffered. Journalctl can emit a null value for large fields, which the viewer treats as unavailable.
+Use `--no-color` for an uncolored display. Adjacent valid entries with the same host, resolved unit, priority, and message collapse into a group with an occurrence count and journal time span. A diagnostic line appears when input is malformed or oversized, history is evicted, activity is dropped, or the source reports a problem. The tail holds up to 2,000 groups, and activity holds up to 16,384 intake entries, with a separate 12 MiB text budget for each. If the activity buffer reaches a limit before entries expire, its counts reflect the retained window. Journal lines over 64 KiB are discarded before their complete contents can be buffered. Journalctl can emit a null value for large fields, which the viewer treats as unavailable.
 
 ## Develop and verify
 

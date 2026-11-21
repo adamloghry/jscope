@@ -81,13 +81,10 @@ struct Args {
 impl Args {
     fn initial_state(&self) -> io::Result<State> {
         let mut state = State::default();
-        if !self.mute_unit.is_empty() {
-            state.set_muted(false);
-            for unit in &self.mute_unit {
-                state
-                    .set_unit_muted(&sanitize(unit), true)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            }
+        for unit in &self.mute_unit {
+            state
+                .set_unit_muted(&sanitize(unit), true)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         }
         Ok(state)
     }
@@ -324,6 +321,7 @@ fn run(args: Args) -> io::Result<ExitCode> {
         if last_draw.is_none_or(|last| last.elapsed() >= redraw_after) {
             let status = ui::Status {
                 source: input.label(),
+                ended: input.ended,
                 notice: controls.notice.as_deref().or(input.notice.as_deref()),
                 malformed: input.malformed,
                 oversized: input.oversized,
@@ -381,6 +379,26 @@ fn main() -> ExitCode {
 mod tests {
     use super::Args;
     use clap::Parser;
+    use jscope::journal::{Decoder, Frame, MAX_LINE_BYTES};
+
+    #[test]
+    fn live_and_replay_start_with_every_received_priority_visible() {
+        for argv in [&["jscope"][..], &["jscope", "--input", "-"]] {
+            let args = Args::try_parse_from(argv).unwrap();
+            let mut state = args.initial_state().unwrap();
+            let demo = include_bytes!("../fixtures/demo.jsonl");
+            let mut decoder = Decoder::new(demo.as_slice(), MAX_LINE_BYTES);
+            while let Some(Frame::Event(event)) = decoder.next_frame().unwrap() {
+                state.ingest(event, 0);
+            }
+            assert_eq!(state.counters().received, 11);
+            assert_eq!(state.visible_rows().map(|row| row.count).sum::<u64>(), 11);
+            state.toggle_mute();
+            assert_eq!(state.visible_rows().map(|row| row.count).sum::<u64>(), 3);
+            state.toggle_mute();
+            assert_eq!(state.visible_rows().map(|row| row.count).sum::<u64>(), 11);
+        }
+    }
 
     #[test]
     fn replay_accepts_repeated_display_mutes() {
