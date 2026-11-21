@@ -39,6 +39,17 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-33 | Occurrence owner and integrator, exact message navigation | verified | JS-28, JS-32 integration | Complete. The combined flake and packaged cursor walkthrough passed |
 | JS-34 | Recovery owner and integrator, service rate recovery | verified | JS-20, JS-33 integration | Combined timed replay, sandboxed flake checks and two-boot VM passed on x86_64-linux |
 
+## Publishing work
+
+| ID | Owner | State | Dependencies | Next action |
+| --- | --- | --- | --- | --- |
+| JS-35 | Context owner | verified | Exact receipts | Integrated flake check and packaged keyboard walkthrough passed |
+| JS-36 | Pattern owner | active | Ranked messages | Group variable IDs on request and retain the exact originals |
+| JS-37 | NixOS marker owner | active | Structured journal format | Emit and navigate opt-in system activation markers |
+| JS-38 | Integrator | active | JS-37 marker fields | Add a read-only closure diff to the marker view |
+| JS-39 | Integrator | active | Flake package and pins | Supply declarative NixOS host defaults and check overrides |
+| JS-40 | Integrator | active | JS-35–39 | Verify each commit, capture screenshots and prepare both publication targets |
+
 ## Shared contract
 
 Live input and replay fixtures are journalctl JSON, one object per line, with journal field names. Invalid lines can appear in regression fixtures. `journal::Event` stores optional journal realtime in microseconds, cursor, priority (0–7), and host, plus resolved unit, its journal source and other usable identity fields, and the sanitized message. The unit fallback starts with `_SYSTEMD_USER_UNIT`, followed by `_SYSTEMD_UNIT`, `SYSLOG_IDENTIFIER`, `_COMM`, and `(unknown)`. Duplicate fields use the first usable value. Journal byte arrays preserve valid UTF-8 and escape invalid bytes. Reader outcomes distinguish malformed and oversized lines, EOF, and source errors.

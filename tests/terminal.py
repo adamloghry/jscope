@@ -324,6 +324,25 @@ def test_follow_ranked_message(binary, fixture):
         wait_for("Paused", "outside filters", "Spike cursor demo-02", "Latest cursor demo-05")
 
 
+def test_cross_service_context(binary, fixture):
+    command = [binary, "--input", fixture, "--mute-unit", "indexer.service", "--no-color"]
+    with terminal(command, columns=80, lines=24, env={"TZ": "UTC0"}) as (_, keys, wait_for):
+        wait_for("11/min", "9/2/7")
+        keys(b"\t\r1\x1b[Cc")
+        screen = wait_for("Context ±2s", "11 retained", "2/11 · Cursor demo-02", "Backend latency above target")
+        assert "›◆ 08:53:20.200 demo indexer INFO Polling job queue" in screen, screen
+        keys(b"\x1b[B\x1b[B")
+        wait_for("4/11 · Cursor demo-04", "›  08:53:20.600 demo proxy WARN")
+        keys(b"\x1b")
+        wait_for("Occurrence 2/6", "Cursor demo-02")
+        keys(b"\rc")
+        wait_for("Context ±2s", "2/11 · Cursor demo-02")
+        keys(b"\x1b")
+        wait_for("Paused", "outside filters", "Polling job queue")
+        keys(b"g")
+        wait_for("9/2/7", absent=("outside filters", "Polling job queue"))
+
+
 if __name__ == "__main__":
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
@@ -332,3 +351,4 @@ if __name__ == "__main__":
     test_compare_spike_drivers(sys.argv[1], sys.argv[2])
     test_tail_spike_hops(sys.argv[1])
     test_follow_ranked_message(sys.argv[1], sys.argv[2])
+    test_cross_service_context(sys.argv[1], sys.argv[2])

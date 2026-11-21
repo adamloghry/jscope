@@ -205,6 +205,21 @@ impl Controls {
         if key.code == KeyCode::Char('q') {
             return false;
         }
+        if state.context().is_some() {
+            match key.code {
+                KeyCode::Up => state.move_context(-1),
+                KeyCode::Down => state.move_context(1),
+                KeyCode::PageUp => state.move_context(-10),
+                KeyCode::PageDown => state.move_context(10),
+                KeyCode::Esc | KeyCode::Char('c') => state.close_context(),
+                KeyCode::Char('g') | KeyCode::End => {
+                    state.jump_live();
+                    self.service_focus = false;
+                }
+                _ => {}
+            }
+            return true;
+        }
         if state.spike().is_some() {
             self.spike_key(key.code, state);
             return true;
@@ -227,6 +242,9 @@ impl Controls {
                     (!state.begin_spike()).then(|| "No service has activity to inspect".into());
             }
             KeyCode::Enter => state.toggle_expanded(),
+            KeyCode::Char('c') if !self.service_focus => {
+                self.notice = state.open_context().err().map(String::from);
+            }
             KeyCode::Char('p') if self.service_focus => {
                 self.notice = state.toggle_pin().err().map(String::from);
             }
@@ -255,6 +273,9 @@ impl Controls {
                     .follow_message(rank as usize - '1' as usize)
                     .err()
                     .map(String::from);
+            }
+            KeyCode::Char('c') if following => {
+                self.notice = state.open_context().err().map(String::from);
             }
             KeyCode::Left if following => state.move_occurrence(-1),
             KeyCode::Right if following => state.move_occurrence(1),

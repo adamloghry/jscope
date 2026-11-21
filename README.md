@@ -46,6 +46,12 @@ In the muted-indexer demo, press **Tab → Enter → 1**. The six “Polling job
 
 Activity accounting shares a record for consecutive exact repeats received in the same millisecond. JournalScope keeps the first receipt of each retained record and caches up to 4,096 additional repeat receipts with a 4 MiB text budget. The browser shows how many repeat details were omitted when that cache filled. If a captured occurrence's tail row is later evicted, its metadata remains readable in the browser.
 
+### See what happened around an entry
+
+Press **c** on a journal row, a spike landing, or an individual message occurrence to open the two seconds before and after its journal timestamp. The frozen list includes all services and hosts, including rows hidden by search, solo or mute. **◆** marks the original occurrence. Browse with **↑/↓** or **PgUp/PgDn**, then press **Esc** to return. In the demo, press **Tab → Enter → 1 → c** to see where the proxy warning interrupted the indexer.
+
+Context uses retained receipts with journal timestamps, including available repeat endpoints. It shows up to 257 entries around the anchor, orders timestamp ties by arrival, and reports additional matching entries beyond the cap. A row with no journal timestamp displays a notice.
+
 ### Compare two services
 
 In the service list, press **p** on a service to pin it, then **Enter** on a different service to see both graphs together. Pin the second service too if you want to keep the pair, including when either goes quiet. Open either pinned service to compare them again. Press **p** on a pin to release it.
@@ -97,6 +103,7 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 | Enter | In the tail, expand or close details. In services, inspect the unit's graph. In the inspector, jump to the selected interval |
 | 1 / 2 / 3 in the inspector | Follow that ranked message in the selected service and interval |
 | ← / → while following a message | Move to the previous or next exact occurrence. Enter jumps to the tail, Esc goes back to the graph |
+| c | Open a ±2-second cross-service context window from the tail or occurrence browser. Esc returns |
 | p | Pin or unpin the selected service for comparison (up to two) |
 | ← / → | Select an older or newer five-second interval in the inspector |
 | ↑ / ↓ in a paired inspector | Switch the active service at the same interval |

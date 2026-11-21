@@ -1,4 +1,7 @@
+mod context;
 mod recovery;
+
+pub use context::Surroundings;
 
 use crate::journal::{Event, UNKNOWN_UNIT};
 use recovery::Recoveries;
@@ -119,13 +122,6 @@ struct Intake {
     count: u64,
 }
 
-/// Same-millisecond repeats share a rate record, while their journal cursors can differ.
-#[derive(Debug)]
-struct RepeatReceipt {
-    id: u64,
-    target: SpikeTarget,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum BinSeverity {
     #[default]
@@ -146,6 +142,7 @@ impl BinSeverity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SpikeTarget {
+    receipt_id: u64,
     group_id: u64,
     event: Arc<Event>,
 }
@@ -192,6 +189,7 @@ impl SpikeBin {
         if self.count == 0 || severity > self.severity {
             self.severity = severity;
             self.target = Some(SpikeTarget {
+                receipt_id: entry.first_id,
                 group_id: entry.group_id,
                 event: Arc::clone(&entry.event),
             });
@@ -329,7 +327,7 @@ pub struct State {
     rows: VecDeque<Group>,
     grouping: Grouping,
     intake: VecDeque<Intake>,
-    repeats: VecDeque<RepeatReceipt>,
+    repeats: VecDeque<SpikeTarget>,
     repeat_bytes: usize,
     row_bytes: usize,
     activity_bytes: usize,
@@ -352,6 +350,7 @@ pub struct State {
     spike: Option<SpikeSnapshot>,
     spike_hit: Option<SpikeTarget>,
     spike_trail: Option<SpikeTrail>,
+    context: Option<Surroundings>,
     selected_unit: Option<String>,
     expanded: Option<u64>,
     detail_scroll: usize,
@@ -392,6 +391,7 @@ impl State {
             spike: None,
             spike_hit: None,
             spike_trail: None,
+            context: None,
             selected_unit: None,
             expanded: None,
             detail_scroll: 0,
@@ -435,9 +435,10 @@ impl State {
         {
             last.count += 1;
             self.repeat_bytes += event_bytes(&event);
-            self.repeats.push_back(RepeatReceipt {
-                id: self.counters.received,
-                target: SpikeTarget { group_id, event },
+            self.repeats.push_back(SpikeTarget {
+                receipt_id: self.counters.received,
+                group_id,
+                event,
             });
             while self.repeats.len() > MAX_REPEAT_RECEIPTS || self.repeat_bytes > MAX_REPEAT_BYTES {
                 self.pop_repeat();
@@ -470,7 +471,7 @@ impl State {
         while self
             .repeats
             .front()
-            .is_some_and(|receipt| receipt.id <= last_id)
+            .is_some_and(|receipt| receipt.receipt_id <= last_id)
         {
             self.pop_repeat();
         }
@@ -482,7 +483,7 @@ impl State {
             .repeats
             .pop_front()
             .expect("a repeat receipt to remove");
-        self.repeat_bytes -= event_bytes(&receipt.target.event);
+        self.repeat_bytes -= event_bytes(&receipt.event);
     }
 
     fn record_row(&mut self, event: Arc<Event>) -> u64 {
@@ -772,6 +773,7 @@ impl State {
     }
 
     pub fn jump_live(&mut self) {
+        self.close_context();
         self.cancel_spike();
         self.set_paused(false);
     }
@@ -889,18 +891,19 @@ impl State {
                 continue;
             };
             driver.receipts.push(SpikeTarget {
+                receipt_id: entry.first_id,
                 group_id: entry.group_id,
                 event: Arc::clone(&entry.event),
             });
             if entry.count > 1 {
                 let start = self
                     .repeats
-                    .partition_point(|receipt| receipt.id <= entry.first_id);
+                    .partition_point(|receipt| receipt.receipt_id <= entry.first_id);
                 driver.receipts.extend(
                     self.repeats
                         .range(start..)
-                        .take_while(|receipt| receipt.id - entry.first_id < entry.count)
-                        .map(|receipt| receipt.target.clone()),
+                        .take_while(|receipt| receipt.receipt_id - entry.first_id < entry.count)
+                        .cloned(),
                 );
             }
         }

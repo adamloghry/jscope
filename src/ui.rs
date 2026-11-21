@@ -1,7 +1,7 @@
 use crate::journal::Event;
 use crate::state::{
     BinSeverity, Group, Grouping, MessageOccurrence, SPARK_BINS, SpikeBin, SpikeSnapshot, State,
-    UnitActivity, WINDOW_MS,
+    Surroundings, UnitActivity, WINDOW_MS,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -25,9 +25,10 @@ pub struct Status<'a> {
 pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_color: bool) -> usize {
     let area = frame.area();
     let wide = area.width >= 104;
-    let expanded = state
-        .expanded_group()
-        .filter(|_| state.spike().is_none() && (wide || !status.service_focus));
+    let context = state.context();
+    let expanded = state.expanded_group().filter(|_| {
+        context.is_none() && state.spike().is_none() && (wide || !status.service_focus)
+    });
     let detail_height = expanded.map_or(0, |_| (area.height / 2).clamp(4, 12));
     let summaries = state.sidebar_activity();
     let diagnostics = diagnostic_line(state, status);
@@ -43,7 +44,7 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
         Constraint::Length(1),
         Constraint::Length(notices.len() as u16),
         Constraint::Length(u16::from(
-            !wide && !status.service_focus && !summaries.is_empty(),
+            context.is_none() && !wide && !status.service_focus && !summaries.is_empty(),
         )),
         Constraint::Min(1),
         Constraint::Length(detail_height),
@@ -63,6 +64,10 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
         render_leader(frame, leader, state, entry, no_color);
     }
     render_footer(frame, footer, state, status, no_color);
+    if let Some(context) = context {
+        render_context(frame, body, context, no_color);
+        return 0;
+    }
     if let Some(occurrence) = state.spike().and_then(SpikeSnapshot::occurrence) {
         return render_occurrence(frame, body, occurrence, state.detail_scroll(), no_color);
     }
@@ -851,6 +856,64 @@ fn render_details(
     render_scrollable_fields(frame, area, block, &fields, scroll)
 }
 
+fn render_context(frame: &mut Frame<'_>, area: Rect, context: &Surroundings, no_color: bool) {
+    let mut title = format!("Context ±2s · {} retained", context.events.len());
+    if context.omitted > 0 {
+        title.push_str(&format!(" · {} more", context.omitted));
+    }
+    let block = section(title, true, no_color);
+    let content = block.inner(area);
+    frame.render_widget(block, area);
+    let [rows, info] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(content);
+    let height = usize::from(rows.height);
+    let start = context
+        .selected
+        .saturating_sub(height / 2)
+        .min(context.events.len().saturating_sub(height));
+    let mut lines = Vec::new();
+    for (i, event) in context.events.iter().enumerate().skip(start).take(height) {
+        let (label, style) = severity(event.priority, no_color);
+        let width = usize::from(rows.width);
+        let host = truncate_display(event.host.as_deref().unwrap_or("?"), (width / 6).min(20));
+        let unit = truncate_display(
+            event.unit.strip_suffix(".service").unwrap_or(&event.unit),
+            width / 4,
+        );
+        let stamp = crate::local_time::format(event.realtime_us);
+        let mut line = Line::from(vec![
+            Span::raw(if i == context.selected { "›" } else { " " }),
+            Span::styled(
+                if i == context.anchor { "◆ " } else { "  " },
+                colored(Color::LightCyan, no_color),
+            ),
+            Span::styled(stamp, Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(" "),
+            Span::raw(host),
+            Span::raw(" "),
+            Span::styled(unit, unit_style(&event.unit, no_color)),
+            Span::raw(" "),
+            Span::styled(label, style),
+            Span::raw(" "),
+            Span::raw(event.message.as_str()),
+        ]);
+        if i == context.selected {
+            line = line.style(Style::default().add_modifier(Modifier::BOLD));
+        }
+        lines.push(line);
+    }
+    frame.render_widget(Paragraph::new(lines), rows);
+    let selected = &context.events[context.selected];
+    frame.render_widget(
+        Line::raw(format!(
+            "{}/{} · Cursor {}",
+            context.selected + 1,
+            context.events.len(),
+            selected.cursor.as_deref().unwrap_or("(missing)")
+        )),
+        info,
+    );
+}
+
 fn render_occurrence(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -971,9 +1034,19 @@ fn render_footer(
     let mut spans = Vec::new();
     let separator = if area.width >= 88 { "  " } else { " " };
     let mut keys = Vec::new();
-    if state.spike().and_then(SpikeSnapshot::occurrence).is_some() {
+    if state.context().is_some() {
+        keys.extend([
+            ("↑↓", "browse"),
+            ("◆", "anchor"),
+            ("Esc", "back"),
+            ("PgUp/Dn", "page"),
+            ("g", "live"),
+            ("q", "quit"),
+        ]);
+    } else if state.spike().and_then(SpikeSnapshot::occurrence).is_some() {
         keys.extend([
             ("←→", "occurrence"),
+            ("c", "context"),
             ("Enter", "jump"),
             ("Esc", "back"),
             ("PgUp/Dn", "scroll"),
@@ -1008,7 +1081,7 @@ fn render_footer(
         if status.service_focus {
             keys.extend([("Enter", "spike"), ("p", "pin"), ("s", "solo")]);
         } else {
-            keys.extend([("↵", "view"), ("[]", "spikes")]);
+            keys.extend([("↵", "view"), ("[]", "spikes"), ("c", "context")]);
         }
         keys.extend([
             ("g", "live"),
