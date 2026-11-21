@@ -35,7 +35,7 @@ Use **←/→** to select a bar. The preview shows the first error-or-higher ent
 
 ### Find what drove a spike
 
-**Top messages** ranks the three most frequent messages in the selected service and interval. A row such as `6/9 · Polling job queue` means that exact text accounted for six of the service's nine arrivals. Repeats count individually across priorities and hosts. Search, solo and mute leave these counts intact. Ties sort by message text. The breakdown stays frozen as you scrub.
+**Top messages** ranks the three most frequent messages in the selected service and interval. A row such as `1→6/9 · Polling job queue` means that exact text occurred once in the previous five seconds and six times among the selected interval's nine arrivals. The lookup includes every message in the preceding interval, even one that fell outside its top three. A `?` before the arrow means the earlier interval predates startup or overlaps missing intake history. An observed interval with no matches shows `0`. Repeats count individually across priorities and hosts. Search, solo and mute leave these counts intact. Ties sort by message text. The breakdown stays frozen as you scrub.
 
 ### Compare two services
 

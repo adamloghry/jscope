@@ -148,6 +148,8 @@ impl SpikeTarget {
 pub struct MessageCount {
     pub message: String,
     pub count: u64,
+    /// Count of this exact text in the previous five seconds, if fully observed.
+    pub previous_count: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -753,24 +755,34 @@ impl State {
 
     fn capture_lane(&self, unit: &str) -> SpikeLane {
         let mut bins: [SpikeBin; SPARK_BINS] = Default::default();
-        let mut messages: [BTreeMap<&str, u64>; SPARK_BINS] = Default::default();
-        for (index, entry) in self
-            .window_entries()
-            .filter(|(_, entry)| entry.event.unit == unit)
-        {
-            bins[index].add(entry);
-            *messages[index].entry(&entry.event.message).or_default() += entry.count;
+        // The first tally covers the extra five seconds before the visible graph.
+        let mut messages: [BTreeMap<&str, u64>; SPARK_BINS + 1] = Default::default();
+        for entry in self.intake.iter().filter(|entry| entry.event.unit == unit) {
+            let tally = if let Some(index) = activity_bin(self.now - entry.at) {
+                bins[index].add(entry);
+                &mut messages[index + 1]
+            } else {
+                &mut messages[0]
+            };
+            *tally.entry(&entry.event.message).or_default() += entry.count;
         }
-        for (bin, counts) in bins.iter_mut().zip(messages) {
-            let mut ranked: Vec<_> = counts.into_iter().collect();
+        for (index, bin) in bins.iter_mut().enumerate() {
+            let previous = &messages[index];
+            let age_at_start = COMPARISON_WINDOW_MS - index as u64 * BIN_MS;
+            let complete = self.now >= age_at_start
+                && self
+                    .last_activity_drop_at
+                    .is_none_or(|at| self.now - at >= age_at_start);
+            let mut ranked: Vec<_> = messages[index + 1].iter().collect();
             ranked.sort_unstable_by(|(a, n), (b, m)| m.cmp(n).then_with(|| a.cmp(b)));
             // The tally borrows intake text. Only the winners survive capture.
             bin.drivers = ranked
                 .into_iter()
                 .take(MAX_MESSAGE_DRIVERS)
-                .map(|(message, count)| MessageCount {
+                .map(|(&message, &count)| MessageCount {
                     message: message.to_owned(),
                     count,
+                    previous_count: complete.then(|| previous.get(message).copied().unwrap_or(0)),
                 })
                 .collect();
         }

@@ -341,6 +341,49 @@ fn demo_compares_the_muted_volume_driver_with_the_peer_warning() {
 }
 
 #[test]
+fn oldest_bin_compares_exact_messages_outside_the_visible_minute() {
+    let mut state = State::default();
+    receive(&mut state, 0, "api", 6, "retry", "expired");
+    for text in ["a", "a", "b", "b", "c", "c", "retry"] {
+        receive(&mut state, 5_000, "api", 6, text, "previous");
+    }
+    receive(&mut state, 5_000, "db", 6, "retry", "other-unit");
+    for text in ["retry", "retry", "Retry"] {
+        receive(&mut state, 5_001, "api", 4, text, "oldest-visible");
+    }
+    state.advance(65_000);
+    state.set_search("hidden");
+    assert!(state.begin_spike());
+    state.advance(150_000);
+    let bin = &state.spike().unwrap().bins[0];
+    let counts: Vec<_> = bin
+        .drivers
+        .iter()
+        .map(|d| (d.message.as_str(), d.previous_count, d.count))
+        .collect();
+    assert_eq!(counts, [("retry", Some(1), 2), ("Retry", Some(0), 1)]);
+}
+
+#[test]
+fn previous_count_requires_complete_observation_after_startup_or_a_drop() {
+    let mut state = State::new(10, 2);
+    let newest_previous = |state: &mut State| {
+        assert!(state.begin_spike());
+        state.spike().unwrap().bins[11].drivers[0].previous_count
+    };
+    receive(&mut state, 3_000, "api", 6, "retry", "previous");
+    assert_eq!(newest_previous(&mut state), None);
+    receive(&mut state, 9_000, "api", 6, "retry", "current");
+    state.advance(10_000);
+    assert_eq!(newest_previous(&mut state), Some(1));
+    receive(&mut state, 10_000, "api", 6, "retry", "another");
+    assert_eq!(state.counters().activity_dropped, 1);
+    assert_eq!(newest_previous(&mut state), None);
+    state.advance(13_000);
+    assert_eq!(newest_previous(&mut state), Some(0));
+}
+
+#[test]
 fn replacing_a_pin_requires_unpinning_and_quiet_pins_stay_reachable() {
     let mut state = State::default();
     assert!(state.toggle_pin().is_err());

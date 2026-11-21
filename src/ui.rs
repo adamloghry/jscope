@@ -629,9 +629,15 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
             Span::styled(label, severity_style),
         ]));
         lines.push(Line::raw(truncate_display(&event.message, width)));
-        lines.push(Line::styled("Top messages", accent));
+        lines.push(Line::from(vec![
+            Span::styled("Top messages", accent),
+            Span::styled(" · prev→now/total", dim),
+        ]));
         for driver in &bin.drivers {
-            let share = format!("{}/{} · ", driver.count, bin.count);
+            let previous = driver
+                .previous_count
+                .map_or_else(|| "?".into(), |n| n.to_string());
+            let share = format!("{previous}→{}/{} · ", driver.count, bin.count);
             let message = truncate_display(&driver.message, width.saturating_sub(share.width()));
             lines.push(Line::from(vec![
                 Span::styled(share, accent),
@@ -1140,7 +1146,8 @@ mod tests {
                 assert!(view.contains("noisy.service"), "{view}");
                 assert!(view.contains("0–5s before capture"), "{view}");
                 assert!(view.contains("2 entries · first error or higher"), "{view}");
-                assert!(view.contains("queue failed"), "{view}");
+                assert!(view.contains("prev→now/total"), "{view}");
+                assert!(view.contains("1→2/2 · queue failed"), "{view}");
                 assert!(
                     view.contains("Enter jump") && view.contains("Esc back"),
                     "{view}"

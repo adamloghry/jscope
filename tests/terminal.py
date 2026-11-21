@@ -263,7 +263,7 @@ def test_compare_spike_drivers(binary, fixture):
             assert any("proxy.service" in row and "08:53:20.600" in row for row in contents.splitlines()), contents
             assert any("indexer.service" in row and "08:53:21.600" in row for row in contents.splitlines()), contents
             keys(b"\x1b[B")
-            contents = wait_for("› indexer.service", "6/9 · Polling job queue", "2/9 · Job queue")
+            contents = wait_for("› indexer.service", "?→6/9 · Polling job queue", "?→2/9 · Job queue")
             assert "1/9 · Leased work item" in contents, contents
             assert contents.count("[!") == 2, contents
             keys(b"\x1b[D")

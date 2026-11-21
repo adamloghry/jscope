@@ -35,6 +35,9 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-29 | UI owner, src/ui.rs | verified | JS-28 interface | All 14 UI tests passed, including color and monochrome comparisons at two widths |
 | JS-30 | Test owner, tests/properties.rs and tests/replay.rs | verified | JS-28 interface | Five Hegel properties and eleven replay tests passed |
 | JS-31 | Integrator, controls, packaged terminal tests, docs and check-in | verified | JS-28–30 | None on x86_64-linux |
+| JS-32 | Comparison owner and integrator, interval message counts | verified | JS-28 | Complete. 70 Rust tests and packaged terminal checks passed on x86_64-linux |
+| JS-33 | Occurrence owner and integrator, exact message navigation | active | JS-28, JS-32 integration | Freeze bounded occurrence identities and test cursor-by-cursor navigation |
+| JS-34 | Recovery owner and integrator, service rate recovery | active | JS-20, JS-33 integration | Track a return to the pre-burst rate and verify the marker and duration |
 
 ## Shared contract
 
@@ -44,13 +47,15 @@ State receives monotonic intake times as milliseconds. The rolling window includ
 
 The default burst grouping also folds exact routine repeats across other sources within five seconds and eight input positions of the first occurrence. Groups keep their first positions. Warnings and unknown priorities use adjacent-only folding. Pass `--adjacent-only` to use that rule for every group.
 
-Graph bins keep the worst incoming severity. The rising arrow compares five seconds of intake to up to 60 preceding seconds within the existing activity memory budget. It becomes eligible after 15 seconds of observation, requires at least three arrivals and a twofold rate increase, and waits for complete comparison history after a capacity loss. The extra five seconds of retention are used only for that comparison.
+Graph bins keep the worst incoming severity. The rising arrow compares five seconds of intake to up to 60 preceding seconds within the existing activity memory budget. It becomes eligible after 15 seconds of observation, requires at least three arrivals and a twofold rate increase, and waits for complete comparison history after a capacity loss. The extra five seconds of retention also supply message comparisons for the oldest visible graph interval.
 
 The spike inspector captures twelve five-second intake bins per service, for up to two services on the same clock. Each bin keeps one representative event and up to three ranked message texts. A jump anchors the paused tail at the earliest occurrence of the displayed severity class. A filtered hit gets a temporary one-row reveal. An inspector target evicted from tail history reports eviction, even if a later entry has identical text. Tail hopping retains up to twelve marked occurrences, skipping evicted targets and reporting when all remaining candidates have gone.
 
 Replay has no control records or timing directives. Tests advance the state clock independently of journal timestamps. In the demo, `indexer.service` leads the first 60 seconds with 9 incoming, 2 visible, and 7 suppressed occurrences. Its paired warnings appear as one group.
 
 ## Recent decisions
+
+- Local `trunk` and the working copy were clean at `dd6fa661` before JS-32–34 began. The three features use isolated checkouts and will land in that order, each in its own commit.
 
 - Spike breakdowns count exact message text in retained incoming occurrences, before display filters. The inspector keeps the top three per five-second interval. Pinned services share a capture clock and graph scale. Bracket keys traverse marked warning/error intervals from the tail.
 
@@ -66,6 +71,8 @@ Replay has no control records or timing directives. Tests advance the state cloc
 - `nix flake check --all-systems --no-build` evaluated package, app, dev shell, standard checks, and VM check for x86_64-linux and aarch64-linux. The environment exposes x86_64 builders only, so aarch64-linux build and runtime tests remain open.
 
 ## Spike investigation verification
+
+- The message comparison passed the full flake checks in isolation and after integration. The 150-case receipt model checked both lanes across all twelve intervals. Deterministic tests checked a previous fourth-ranked message, observed zero, incomplete startup, capacity loss, and an oldest-bin comparison surviving expiry.
 
 - At both 80×24 and 104×24, the packaged README replay showed the proxy warning at 08:53:20.600 and the indexer warning at 08:53:21.600 under `TZ=UTC0`. Scrubbing kept both graphs aligned. Switching to the muted indexer showed “Polling job queue” at 6/9, the warning at 2/9, and the leased item at 1/9. Enter landed on the warning with cursor `demo-09`. The walkthrough passed with one pin and the PTY regression exercised both pins.
 - The piped terminal test navigated between two filtered warnings/errors from different services, five seconds apart in receipt time and identical in journal time. It checked exact cursors, both navigation boundaries, continued intake, and restoration of the original search on return to live.

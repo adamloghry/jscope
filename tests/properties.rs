@@ -759,6 +759,18 @@ fn paired_drivers_and_global_hops_match_ungrouped_receipts(tc: TestCase) {
                 .filter(|event| event.unit == unit)
                 .collect();
             check_interval(bin, &lane);
+            let previous_ages = ages.end..ages.end + 5_000;
+            for driver in &bin.drivers {
+                let count = receipts
+                    .iter()
+                    .filter(|(at, event)| {
+                        previous_ages.contains(&(CAPTURE - at))
+                            && event.unit == unit
+                            && event.message == driver.message
+                    })
+                    .count() as u64;
+                assert_eq!(driver.previous_count, Some(count));
+            }
         }
         assert_eq!(snapshot.unit, UNITS[1]);
         assert_eq!(peer.unit, UNITS[0]);
