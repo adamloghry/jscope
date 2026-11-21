@@ -797,3 +797,47 @@ fn paired_drivers_and_global_hops_match_ungrouped_receipts(tc: TestCase) {
     }
     assert!(state.hop_spike(1).is_err());
 }
+
+#[hegel::test(test_cases = 100)]
+fn recovery_matches_a_known_rate_step_with_steady_background(tc: TestCase) {
+    let background = tc.draw(gs::integers::<usize>().max_value(4));
+    let burst_seconds = tc.draw(gs::integers::<u64>().min_value(1).max_value(40));
+    let jitter = tc.draw(gs::integers::<u64>().max_value(999));
+    let mut state = State::default();
+    state.set_search("hidden");
+    let unit = "recovery.service";
+    let event = Event {
+        realtime_us: None,
+        cursor: None,
+        priority: Some(6),
+        host: None,
+        unit: unit.into(),
+        unit_metadata: UnitMetadata::default(),
+        message: "tick".into(),
+    };
+
+    // A one-minute constant pre-burst rate gives a known reference. The
+    // observed five-second rate first equals that reference in the sample
+    // after the final high second has completely left the window.
+    let burst_end = 60 + burst_seconds;
+    let first_quiet = burst_end + 5;
+    let confirmed = first_quiet + 5;
+    for second in 0..confirmed {
+        let per_second = if (60..burst_end).contains(&second) {
+            10 * background + 8
+        } else {
+            background
+        };
+        for _ in 0..per_second {
+            state.ingest(event.clone(), second * 1_000 + jitter);
+        }
+    }
+    state.advance(confirmed * 1_000 - 1);
+    assert_eq!(state.recovery(unit), None);
+    state.advance(confirmed * 1_000);
+    let recovered = state.recovery(unit).unwrap();
+    assert_eq!(recovered.duration_ms, (first_quiet - 61) * 1_000);
+    assert_eq!(recovered.age_ms, 5_000);
+    state.advance((confirmed + 30) * 1_000);
+    assert_eq!(state.recovery(unit), None);
+}

@@ -23,6 +23,7 @@ Use `--unit` for system services or `--user-unit` for user services. Both option
 The service list ranks units by incoming activity. The service graphs share a scale so you can compare bursts across rows. Each row shows its trend and three counts in the order incoming / visible / suppressed. On a narrow terminal, the busiest service stays above the full-width tail. Press Tab for the complete ranking or to return to the log. At 104 columns and wider, the ranking stays beside the log.
 
 - **↑ beside a unit** means it received at least three entries in the last five seconds, at a rate at least twice its average over the preceding minute. After 15 seconds of observation, the arrow can use the portion of that minute already observed. A previously quiet unit can qualify. The comparison pauses if its history is incomplete after a buffer eviction.
+- **↓ beside a unit** marks a return to its pre-burst rate. Once per completed second, JournalScope checks the last five seconds against the same rise threshold as ↑. The first qualifying sample fixes the baseline for that episode. After five continuous seconds at or below that saved rate, `↓12s` means the service spent 12 seconds between the detected rise and the start of the quiet stretch. A previously idle service must go fully quiet. The marker lasts 30 seconds or until another spike begins. Open the service graph to see how long ago the recovery began relative to the captured minute. Muting, search and pause leave recovery tracking active. Losing activity history clears the detector until it has a complete comparison window again.
 - **Amber and red bars** mark time intervals containing a warning or an error, respectively. Critical, alert and emergency entries also turn the bar red. Height still shows volume, and the most severe entry sets the color. With `--no-color`, `!` marks a warning and `×` marks an error or higher. These markers follow incoming events even while a search, mute or solo hides the corresponding log rows.
 
 ### Jump from a spike to its journal entry
@@ -69,7 +70,7 @@ To try **jump to spike** in this demo, press **Tab**, then **Enter** twice. The 
 
 To try the **two-service comparison** from startup, press **Tab**, **p** on the indexer, **↓** to the proxy, then **Enter**. Both services had warnings in the same interval. Switch to the indexer with **↓** to see that six of its nine arrivals say “Polling job queue”, even with the indexer muted.
 
-To see the rising-rate indicator with synthetic input, send the fixture again after a quiet interval. Watch the indexer gain `↑` for five seconds when the second burst arrives. The warning bars from both bursts remain in the graph as they age.
+To see the rising-rate indicator with synthetic input, send the fixture again after a quiet interval. Watch the indexer gain `↑` for five seconds when the second burst arrives. The warning bars from both bursts remain in the graph as they age. Leave the dashboard open after the second burst to see ↓ and the burst duration once the quiet stretch is confirmed.
 
 ```sh
 nix build && { cat fixtures/demo.jsonl; sleep 18; cat fixtures/demo.jsonl; } | ./result/bin/jscope --input -

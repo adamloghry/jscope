@@ -501,7 +501,11 @@ fn render_activity(
     let [legend, list] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let key = Line::from(vec![
+    let recovered = summaries
+        .iter()
+        .any(|unit| state.recovery(&unit.unit).is_some());
+    let width = usize::from(legend.width);
+    let mut key = Line::from(vec![
         Span::styled("↑", rising_style(no_color)),
         Span::styled(" rising ", dim),
         spark_bar("▆", BinSeverity::Warning, dim, no_color),
@@ -509,6 +513,15 @@ fn render_activity(
         spark_bar("▆", BinSeverity::Error, dim, no_color),
         Span::styled(" err+", dim),
     ]);
+    if recovered {
+        let marker = Span::styled("↓ recovered", colored(Color::LightGreen, no_color));
+        if key.width() + marker.width() + "  in/vis/supp".len() <= width {
+            key.push_span(Span::raw(" "));
+            key.push_span(marker);
+        } else {
+            key = Line::from(marker);
+        }
+    }
     let counts = if key.width() + 22 <= usize::from(legend.width) {
         "in/visible/suppressed"
     } else {
@@ -609,6 +622,16 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
             chart.push_span(Span::styled(count, dim));
         }
         lines.push(chart);
+    }
+    if let Some(marker) = spike.recovery {
+        lines.push(Line::styled(
+            format!(
+                "Recovered {}s ago · burst {}s",
+                marker.age_ms / 1_000,
+                marker.duration_ms / 1_000
+            ),
+            colored(Color::LightGreen, no_color),
+        ));
     }
     let bin = &spike.bins[spike.selected];
     let seconds = WINDOW_MS / SPARK_BINS as u64 / 1_000;
@@ -711,6 +734,12 @@ fn activity_spans<'a>(
     let width = if entry.rising {
         spans.push(Span::styled("↑ ", rising_style(no_color)));
         width.saturating_sub(2)
+    } else if let Some(marker) = state.recovery(&entry.unit) {
+        let label = if width >= 48 { "↓ recovered " } else { "↓" };
+        let marker = format!("{label}{}s ", marker.duration_ms / 1_000);
+        let remaining = width.saturating_sub(marker.width());
+        spans.push(Span::styled(marker, colored(Color::LightGreen, no_color)));
+        remaining
     } else {
         width
     };
@@ -1593,6 +1622,69 @@ mod tests {
         state.advance(35_000);
         let view = screen(80, 24, &state, &Status::default());
         assert!(view[1].starts_with("Noisiest noisy.service"), "{}", view[1]);
+    }
+
+    #[test]
+    fn confirmed_recovery_keeps_the_unit_and_counts_on_one_line() {
+        let mut state = State::default();
+        for _ in 0..3 {
+            state.ingest(event("burst", 6, 123), 16_000);
+        }
+        state.set_muted(true);
+        state.advance(27_000);
+        for no_color in [true, false] {
+            for (width, label) in [
+                (80, "↓ recovered 5s noisy.service"),
+                (104, "↓5s noisy.service"),
+            ] {
+                let buffer = render_buffer(width, 24, &state, &Status::default(), no_color);
+                let view = lines(&buffer);
+                let (row, line) = view
+                    .iter()
+                    .enumerate()
+                    .find(|(_, line)| line.contains(label) && line.contains("3/0/3"))
+                    .expect("recovery and counts share the service row");
+                let col = line[..line.find(label).unwrap()].width();
+                assert_eq!(
+                    buffer[(col as u16, row as u16)].fg,
+                    if no_color {
+                        Color::Reset
+                    } else {
+                        Color::LightGreen
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn service_inspector_freezes_recovery_time_for_the_inspected_lane() {
+        let mut state = State::default();
+        for _ in 0..3 {
+            state.ingest(event("alarm", 4, 0), 16_000);
+        }
+        let mut other = event("one message", 6, 1);
+        other.unit = "peer.service".into();
+        state.ingest(other, 18_000);
+        state.advance(30_000);
+        state.toggle_pin().unwrap();
+        state.move_unit(1);
+        state.begin_spike();
+        let status = Status {
+            service_focus: true,
+            ..Default::default()
+        };
+        assert!(
+            !screen(80, 24, &state, &status)
+                .join("\n")
+                .contains("Recovered ")
+        );
+        state.switch_spike_unit();
+        state.advance(100_000);
+        for width in [80, 104] {
+            let view = screen(width, 24, &state, &status).join("\n");
+            assert!(view.contains("Recovered 8s ago · burst 5s"), "{view}");
+        }
     }
 
     #[test]

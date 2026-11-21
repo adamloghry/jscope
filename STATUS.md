@@ -37,7 +37,7 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-31 | Integrator, controls, packaged terminal tests, docs and check-in | verified | JS-28–30 | None on x86_64-linux |
 | JS-32 | Comparison owner and integrator, interval message counts | verified | JS-28 | Complete. 70 Rust tests and packaged terminal checks passed on x86_64-linux |
 | JS-33 | Occurrence owner and integrator, exact message navigation | verified | JS-28, JS-32 integration | Complete. The combined flake and packaged cursor walkthrough passed |
-| JS-34 | Recovery owner and integrator, service rate recovery | active | JS-20, JS-33 integration | Isolated recovery tests passed. Integrate and run the combined timed replay and VM |
+| JS-34 | Recovery owner and integrator, service rate recovery | verified | JS-20, JS-33 integration | Combined timed replay, sandboxed flake checks and two-boot VM passed on x86_64-linux |
 
 ## Shared contract
 
@@ -49,13 +49,13 @@ The default burst grouping also folds exact routine repeats across other sources
 
 Graph bins keep the worst incoming severity. The rising arrow compares five seconds of intake to up to 60 preceding seconds within the existing activity memory budget. It becomes eligible after 15 seconds of observation, requires at least three arrivals and a twofold rate increase, and waits for complete comparison history after a capacity loss. The extra five seconds of retention also supply message comparisons for the oldest visible graph interval.
 
-The spike inspector captures twelve five-second intake bins per service, for up to two services on the same clock. Each bin keeps one representative event and up to three ranked message texts. A jump anchors the paused tail at the earliest occurrence of the displayed severity class. A filtered hit gets a temporary one-row reveal. An inspector target evicted from tail history reports eviction, even if a later entry has identical text. Tail hopping retains up to twelve marked occurrences, skipping evicted targets and reporting when all remaining candidates have gone.
+The spike inspector captures twelve five-second intake bins per service, for up to two services on the same clock. Each bin keeps one representative event, up to three ranked message texts with preceding-interval counts, and the retained occurrences of those texts. Same-millisecond repeats share an activity record. A separate cache retains up to 4,096 additional repeat receipts within 4 MiB of text. A frozen capture reports omitted receipts. A jump anchors the paused tail at the earliest occurrence of the displayed severity class. A filtered hit gets a temporary one-row reveal. An inspector target evicted from tail history reports eviction, even if a later entry has identical text. Tail hopping retains up to twelve marked occurrences, skipping evicted targets and reporting when all remaining candidates have gone.
 
 Replay has no control records or timing directives. Tests advance the state clock independently of journal timestamps. In the demo, `indexer.service` leads the first 60 seconds with 9 incoming, 2 visible, and 7 suppressed occurrences. Its paired warnings appear as one group.
 
 ## Recent decisions
 
-- Local `trunk` and the working copy were clean at `dd6fa661` before JS-32–34 began. The three features use isolated checkouts and will land in that order, each in its own commit.
+- Local `trunk` and the working copy were clean at `dd6fa661` before JS-32–34 began. The three features were developed in isolated checkouts for independent verification and check-in.
 
 - Spike breakdowns count exact message text in retained incoming occurrences, before display filters. The inspector keeps the top three per five-second interval. Pinned services share a capture clock and graph scale. Bracket keys traverse marked warning/error intervals from the tail.
 
@@ -65,7 +65,7 @@ Replay has no control records or timing directives. Tests advance the state cloc
 
 ## Verification evidence
 
-- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 71 Rust tests including five Hegel properties, thirteen replay tests, five retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
+- `nix flake check -L` passed on x86_64-linux with sandboxing enabled. It ran rustfmt, strict Clippy across all targets, and 77 Rust tests including six Hegel properties, thirteen replay tests, five retention regressions, and three subprocess tests. Cargo built offline. PTY checks ran the packaged app with no arguments against a synthetic follow process and with stdin connected to an open journal pipe. They verified the compact header, local time, filtering, service focus, pause, quit, and terminal restoration. No generated failure needed minimization. The ordinary parser regression fixture is in `fixtures/parser-regressions.jsonl`.
 - `nix build .#vm-test --no-link -L` passed on x86_64-linux in a disposable NixOS VM. It verified real journalctl follow, matching unit and priority filters, exclusion of archived records from a prior guest boot, zero and nonzero backlogs, SIGTERM shutdown, child reaping, and restored terminal settings. All logs used for the test were synthetic guest records.
 - The exact README replay command passed in an 80×24 pseudo-terminal. File and piped replay also passed direct PTY smoke tests, including details, unmute, clean quit, and terminal restoration with the pipe still open. `nix run . -- --help` verified the default app entry point.
 - `nix flake check --all-systems --no-build` evaluated package, app, dev shell, standard checks, and VM check for x86_64-linux and aarch64-linux. The environment exposes x86_64 builders only, so aarch64-linux build and runtime tests remain open.
@@ -74,6 +74,7 @@ Replay has no control records or timing directives. Tests advance the state cloc
 
 - The message comparison passed the full flake checks in isolation and after integration. The 150-case receipt model checked both lanes across all twelve intervals. Deterministic tests checked a previous fourth-ranked message, observed zero, incomplete startup, capacity loss, and an oldest-bin comparison surviving expiry.
 - In a timed 80-column replay the muted service produced `1→6/7 · retry` and `0→1/7 · queue blocked`. The packaged occurrence test stepped through all six demo poll cursors, switched ranks, and landed on `demo-02` inside the repeat group ending at `demo-05`. Model and capacity tests checked order, cache gaps, preserved counts, and exact identity after tail eviction.
+- The final 104-column timed walkthrough combined all three changes. It saw one retry grow to six, visited all six cursors in order, landed on the last hidden retry, then observed `↓5s` with 8 incoming, 1 visible and 7 suppressed. A fresh inspector showed `Recovered 5s ago · burst 5s` after confirmation. The 100-case Hegel recovery test varied the background rate, burst length and receipt-time offset; deterministic tests covered silence, sustained elevation, recurrence, expiry, capacity loss and long clock advances.
 
 - At both 80×24 and 104×24, the packaged README replay showed the proxy warning at 08:53:20.600 and the indexer warning at 08:53:21.600 under `TZ=UTC0`. Scrubbing kept both graphs aligned. Switching to the muted indexer showed “Polling job queue” at 6/9, the warning at 2/9, and the leased item at 1/9. Enter landed on the warning with cursor `demo-09`. The walkthrough passed with one pin and the PTY regression exercised both pins.
 - The piped terminal test navigated between two filtered warnings/errors from different services, five seconds apart in receipt time and identical in journal time. It checked exact cursors, both navigation boundaries, continued intake, and restoration of the original search on return to live.

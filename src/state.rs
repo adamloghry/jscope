@@ -1,4 +1,7 @@
+mod recovery;
+
 use crate::journal::{Event, UNKNOWN_UNIT};
+use recovery::Recoveries;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
@@ -197,9 +200,19 @@ impl SpikeBin {
     }
 }
 
+/// A confirmed return to the pre-burst rate, measured on the intake clock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Recovery {
+    /// Time from the first rising sample to the start of the confirmed quiet stretch.
+    pub duration_ms: u64,
+    /// Time since that quiet stretch began, relative to the observation or snapshot.
+    pub age_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct SpikeLane {
     pub unit: String,
+    pub recovery: Option<Recovery>,
     pub bins: [SpikeBin; SPARK_BINS],
 }
 
@@ -207,6 +220,7 @@ pub struct SpikeLane {
 #[derive(Debug)]
 pub struct SpikeSnapshot {
     pub unit: String,
+    pub recovery: Option<Recovery>,
     pub bins: [SpikeBin; SPARK_BINS],
     pub selected: usize,
     pub peer: Option<SpikeLane>,
@@ -323,6 +337,7 @@ pub struct State {
     max_activity: usize,
     now: u64,
     last_activity_drop_at: Option<u64>,
+    recoveries: Recoveries,
     counters: Counters,
     first_host: Option<String>,
     multiple_hosts: bool,
@@ -362,6 +377,7 @@ impl State {
             max_activity,
             now: 0,
             last_activity_drop_at: None,
+            recoveries: Recoveries::default(),
             counters: Counters::default(),
             first_host: None,
             multiple_hosts: false,
@@ -383,7 +399,10 @@ impl State {
     }
 
     pub fn advance(&mut self, now_ms: u64) {
-        self.now = self.now.max(now_ms);
+        let now = self.now.max(now_ms);
+        self.recoveries
+            .advance(self.now, now, &self.intake, self.last_activity_drop_at);
+        self.now = now;
         while self
             .intake
             .front()
@@ -437,6 +456,7 @@ impl State {
         while self.intake.len() > self.max_activity || self.activity_bytes > MAX_ACTIVITY_BYTES {
             let removed = self.pop_intake();
             self.last_activity_drop_at = Some(removed.at);
+            self.recoveries.clear();
             if self.now - removed.at < WINDOW_MS {
                 self.counters.activity_dropped += removed.count;
             }
@@ -567,6 +587,10 @@ impl State {
         self.summarize(false)
     }
 
+    pub fn recovery(&self, unit: &str) -> Option<Recovery> {
+        self.recoveries.marker(unit, self.now)
+    }
+
     pub fn sidebar_activity(&self) -> Vec<UnitActivity> {
         self.summarize(true)
     }
@@ -603,19 +627,15 @@ impl State {
             }
         }
         let baseline_ms = self.now.saturating_sub(BIN_MS).min(WINDOW_MS);
-        let baseline_ready = baseline_ms >= MIN_BASELINE_MS
-            && self
-                .last_activity_drop_at
-                .is_none_or(|at| self.now - at >= COMPARISON_WINDOW_MS);
+        let baseline_complete = self
+            .last_activity_drop_at
+            .is_none_or(|at| self.now - at >= COMPARISON_WINDOW_MS);
         let mut totals: Vec<_> = totals
             .into_iter()
             .map(|(unit, (mut summary, extra))| {
                 let recent = summary.sparkline[SPARK_BINS - 1];
                 let baseline = summary.incoming - recent + extra;
-                summary.rising = baseline_ready
-                    && recent >= MIN_RISING_COUNT
-                    && u128::from(recent) * u128::from(baseline_ms)
-                        >= 2 * u128::from(baseline) * u128::from(BIN_MS);
+                summary.rising = baseline_complete && rising_rate(recent, baseline, baseline_ms);
                 summary.unit = unit.to_owned();
                 summary
             })
@@ -886,6 +906,7 @@ impl State {
         }
         SpikeLane {
             unit: unit.to_owned(),
+            recovery: self.recovery(unit),
             bins,
         }
     }
@@ -896,7 +917,11 @@ impl State {
             self.spike = None;
             return false;
         };
-        let SpikeLane { unit, bins } = self.capture_lane(&selected.unit);
+        let SpikeLane {
+            unit,
+            bins,
+            recovery,
+        } = self.capture_lane(&selected.unit);
         let peer = if self.pins.len() < MAX_PINS || self.is_pinned(&unit) {
             self.pins
                 .iter()
@@ -921,6 +946,7 @@ impl State {
             .0;
         self.spike = Some(SpikeSnapshot {
             unit,
+            recovery,
             bins,
             selected: index,
             peer,
@@ -951,6 +977,7 @@ impl State {
             spike.following = None;
             std::mem::swap(&mut spike.unit, &mut peer.unit);
             std::mem::swap(&mut spike.bins, &mut peer.bins);
+            std::mem::swap(&mut spike.recovery, &mut peer.recovery);
             spike.peer_first = !spike.peer_first;
         }
     }
@@ -1118,6 +1145,13 @@ impl State {
         self.selected_group()
             .filter(|row| Some(row.id) == self.expanded)
     }
+}
+
+fn rising_rate(recent: u64, baseline: u64, baseline_ms: u64) -> bool {
+    baseline_ms >= MIN_BASELINE_MS
+        && recent >= MIN_RISING_COUNT
+        && u128::from(recent) * u128::from(baseline_ms)
+            >= 2 * u128::from(baseline) * u128::from(BIN_MS)
 }
 
 fn activity_bin(age: u64) -> Option<usize> {
@@ -1424,6 +1458,83 @@ mod tests {
         assert!(!quiet.activity()[0].rising);
         quiet.ingest(e, 15_000);
         assert!(quiet.activity()[0].rising);
+    }
+
+    #[test]
+    fn recovery_through_silence_requires_sustained_quiet_and_expires() {
+        let mut state = State::default();
+        let entry = event("api", 6, "poll", 0);
+        for _ in 0..3 {
+            state.ingest(entry.clone(), 16_000);
+        }
+        state.set_muted(true);
+        state.set_paused(true);
+        state.set_search("unmatched");
+        // The detector observes the rise at 17s and quiet at 22s. One new
+        // occurrence interrupts confirmation, even though it cannot start a rise.
+        state.ingest(entry.clone(), 24_000);
+        state.advance(34_999);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), None);
+        state.advance(35_000);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), Some(13_000));
+        for _ in 0..8 {
+            state.ingest(entry.clone(), 40_000);
+        }
+        state.advance(41_000);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), None);
+        state.advance(80_999);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), Some(5_000));
+        state.advance(81_000);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), None);
+    }
+
+    #[test]
+    fn a_falling_rate_above_the_pre_spike_average_stays_noisy() {
+        let mut state = State::default();
+        let entry = event("api", 6, "work", 0);
+        for second in 0..60 {
+            state.ingest(entry.clone(), second * 1_000);
+        }
+        for second in 60..140 {
+            let rate = if second < 100 {
+                4
+            } else if second % 2 == 0 {
+                2
+            } else {
+                1
+            };
+            for _ in 0..rate {
+                state.ingest(entry.clone(), second * 1_000);
+            }
+        }
+        assert!(!state.activity()[0].rising);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), None);
+        state.advance(150_000);
+        assert!(state.recovery("api").map(|r| r.duration_ms).unwrap() >= 75_000);
+    }
+
+    #[test]
+    fn startup_and_capacity_loss_do_not_manufacture_recoveries() {
+        let mut state = State::new(20, 2);
+        let entry = event("api", 6, "poll", 0);
+        for _ in 0..5 {
+            state.ingest(entry.clone(), 0);
+        }
+        state.advance(15_000);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), None);
+        for _ in 0..10 {
+            state.ingest(entry.clone(), 16_000);
+        }
+        state.advance(17_000);
+        state.ingest(event("other", 6, "fill capacity", 0), 17_001);
+        state.advance(30_000);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), None);
+        state.advance(u64::MAX - 12_000);
+        for _ in 0..3 {
+            state.ingest(entry.clone(), u64::MAX - 12_000);
+        }
+        state.advance(u64::MAX);
+        assert_eq!(state.recovery("api").map(|r| r.duration_ms), Some(5_000));
     }
 
     #[test]
