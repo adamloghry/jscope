@@ -40,7 +40,9 @@ Select the timeout pattern, choose an occurrence, and press **c**. The diamond m
 
 ![Cross-service context around request 7320. A checkout pool warning, shipping dispatch, worker lease and metrics warning surround the selected error with cursor demo-0136.](docs/screenshots/context.png)
 
-## At the keyboard
+## Controls
+
+Mouse reporting is on by default in compatible terminals. Scroll over the journal to browse, then scroll to the newest entry to follow live again. Click a journal row for details, or click a service and a graph bar to investigate a spike. Right-click to go back. Use `--no-mouse` for native terminal text selection.
 
 | From | Key | Action |
 | --- | --- | --- |

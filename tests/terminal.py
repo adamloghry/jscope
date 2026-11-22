@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -17,7 +18,7 @@ import pyte
 
 
 @contextmanager
-def terminal(command, *, columns, lines, piped=False, env=None):
+def terminal(command, *, columns, lines, piped=False, env=None, mouse_capture=None):
     master, slave = pty.openpty()
     try:
         screen = pyte.Screen(columns=columns, lines=lines)
@@ -65,11 +66,20 @@ def terminal(command, *, columns, lines, piped=False, env=None):
 
             try:
                 yield scope, keys, wait_for
-                keys(b"q")
+                if scope.poll() is None:
+                    keys(b"q")
                 assert scope.wait(timeout=10) == 0
                 while select.select([master], [], [], 0)[0]:
                     drain(0)
                 assert b"\x1b[?1049l" in terminal_output
+                if mouse_capture is not None:
+                    for mode in (b"1000", b"1006"):
+                        enabled = terminal_output.find(b"\x1b[?" + mode + b"h")
+                        disabled = terminal_output.rfind(b"\x1b[?" + mode + b"l")
+                        if mouse_capture:
+                            assert 0 <= enabled < disabled, (mode, enabled, disabled)
+                        else:
+                            assert enabled == -1, mode
                 assert termios.tcgetattr(slave) == initial_settings
             finally:
                 if scope.poll() is None:
@@ -94,6 +104,92 @@ def journal_record(unit, level, message, realtime_us=0, cursor=None):
     if cursor is not None:
         record["__CURSOR"] = cursor
     return json.dumps(record) + "\n"
+
+
+def mouse_at(keys, screen, label, button):
+    # xterm SGR uses one-based coordinates. Send the release a terminal emits
+    # for a click as well, so a click handled twice is visible in the tests.
+    row, line = next((i, line) for i, line in enumerate(screen.splitlines(), 1) if label in line)
+    packet = f"\x1b[<{button};{line.index(label) + 1};{row}".encode()
+    keys(packet + b"M" + (packet + b"m" if button in (0, 2) else b""))
+
+
+def test_mouse_tail(binary):
+    command = [binary, "--input", "-", "--no-defaults", "--no-color"]
+    with terminal(command, columns=80, lines=24, piped=True, mouse_capture=True) as (scope, keys, wait):
+        def send(i):
+            message = f"event-{i:02}"
+            if i == 3:
+                message += "x" * 1_600 + " [detail end]"
+            record = journal_record("worker.service", 6, message, i * 1_000_000, f"r-{i:02}")
+            scope.stdin.write(record.encode())
+
+        for i in range(12):
+            send(i)
+        scope.stdin.flush()
+        screen = wait("12/min", "event-11")
+        mouse_at(keys, screen, "event-11", 64)
+        screen = wait("Paused", "event-08", absent=("event-09",))
+        send(12)
+        scope.stdin.flush()
+        screen = wait("13/min", "Paused", absent=("event-09", "event-12"))
+        mouse_at(keys, screen, "event-08", 65)
+        screen = wait("event-11", "Paused", absent=("event-12",))
+        mouse_at(keys, screen, "event-03", 0)
+        screen = wait("Details", "Latest cursor r-03", "Message  event-03")
+        for _ in range(10):
+            mouse_at(keys, screen, "Details", 65)
+        screen = wait("[detail end]", absent=("Latest cursor",))
+        mouse_at(keys, screen, "JournalScope", 0)
+        screen = wait("Live", "event-12", absent=("Details",))
+        mouse_at(keys, screen, "event-12", 64)
+        screen = wait("Paused", "event-09", absent=("event-10",))
+        mouse_at(keys, screen, "event-09", 65)
+        wait("Live", "event-12", absent=("Paused",))
+        scope.send_signal(signal.SIGTERM)
+        assert scope.wait(timeout=10) == 0
+
+
+def test_mouse_inspector(binary, fixture):
+    command = [binary, "--input", fixture, "--no-defaults", "--no-color"]
+    for width in (80, 140):
+        with terminal(command, columns=width, lines=24, mouse_capture=True) as (_, keys, wait):
+            screen = wait("indexer.service", "11/min")
+            if width == 80:
+                mouse_at(keys, screen, "Noisiest", 0)
+                screen = wait("Services · 60s", "proxy.service", absent=("Noisiest",))
+            mouse_at(keys, screen, "proxy.service", 65)
+            screen = wait("› proxy.service")
+            mouse_at(keys, screen, "indexer.service", 0)
+            screen = wait("Spike · 60s", "0–5s before capture", "[1]")
+            mouse_at(keys, screen, "0–5s before capture", 64)
+            screen = wait("5–10s before capture", "empty interval")
+            mouse_at(keys, screen, "5–10s before capture", 65)
+            screen = wait("0–5s before capture", "[1]")
+            mouse_at(keys, screen, "[1]", 0)
+            screen = wait("Occurrence 1/6", "Cursor demo-01")
+            mouse_at(keys, screen, "Cursor demo-01", 67)
+            screen = wait("Occurrence 2/6", "Cursor demo-02")
+            mouse_at(keys, screen, "Cursor demo-02", 64)
+            screen = wait("Occurrence 1/6", "Cursor demo-01", "c context")
+            mouse_at(keys, screen, "c context", 0)
+            screen = wait("Context ±2s", "1/11 · Cursor demo-01")
+            mouse_at(keys, screen, "Backend latency above target", 0)
+            screen = wait("4/11 · Cursor demo-04")
+            mouse_at(keys, screen, "Cursor demo-04", 2)
+            screen = wait("Occurrence 1/6", "Cursor demo-01")
+            mouse_at(keys, screen, "Cursor demo-01", 2)
+            wait("Spike · 60s", "Top messages", absent=("Message occurrences",))
+
+
+def test_mouse_fallback(binary, fixture):
+    for options, term in ((["--no-mouse"], "xterm"), ([], "dumb")):
+        command = [binary, "--input", fixture, "--no-defaults", *options]
+        with terminal(command, columns=80, lines=24, env={"TERM": term}, mouse_capture=False) as (_, keys, wait):
+            screen = wait("Noisiest", "11/min")
+            mouse_at(keys, screen, "Noisiest", 0)
+            keys(b"\t")
+            wait("Services · 60s", "proxy.service", absent=("Noisiest",))
 
 
 def test_default_live(binary):
@@ -408,6 +504,9 @@ def test_closure_diff(binary):
 
 
 if __name__ == "__main__":
+    test_mouse_tail(sys.argv[1])
+    test_mouse_inspector(sys.argv[1], sys.argv[2])
+    test_mouse_fallback(sys.argv[1], sys.argv[2])
     test_default_live(sys.argv[1])
     test_replay(sys.argv[1])
     test_grouped_demo(sys.argv[1], sys.argv[2])

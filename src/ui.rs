@@ -1,3 +1,6 @@
+mod mouse;
+pub use mouse::{MouseMap, MouseTarget};
+
 use crate::journal::Event;
 use crate::state::{
     BinSeverity, Group, Grouping, MessageOccurrence, SPARK_BINS, SpikeBin, SpikeSnapshot, State,
@@ -23,6 +26,17 @@ pub struct Status<'a> {
 }
 
 pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_color: bool) -> usize {
+    render_interactive(frame, state, status, no_color, &mut MouseMap::default())
+}
+
+pub fn render_interactive(
+    frame: &mut Frame<'_>,
+    state: &State,
+    status: &Status<'_>,
+    no_color: bool,
+    mouse: &mut MouseMap,
+) -> usize {
+    mouse.clear();
     let area = frame.area();
     let wide = area.width >= 104;
     let context = state.context();
@@ -52,7 +66,7 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     ])
     .areas(area);
 
-    render_header(frame, header, state, status, &summaries, no_color);
+    render_header(frame, header, state, status, &summaries, no_color, mouse);
     frame.render_widget(
         Paragraph::new(notices.into_iter().map(Line::raw).collect::<Vec<_>>())
             .style(colored(Color::LightYellow, no_color)),
@@ -61,14 +75,16 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
     if !leader.is_empty()
         && let Some(entry) = summaries.first()
     {
+        mouse.add(leader, MouseTarget::Leader);
         render_leader(frame, leader, state, entry, no_color);
     }
-    render_footer(frame, footer, state, status, no_color);
+    render_footer(frame, footer, state, status, no_color, mouse);
     if let Some(context) = context {
-        render_context(frame, body, context, no_color);
+        render_context(frame, body, context, no_color, mouse);
         return 0;
     }
     if let Some(occurrence) = state.spike().and_then(SpikeSnapshot::occurrence) {
+        mouse.add(body, MouseTarget::Occurrence);
         return render_occurrence(frame, body, occurrence, state.detail_scroll(), no_color);
     }
     if wide {
@@ -77,14 +93,15 @@ pub fn render(frame: &mut Frame<'_>, state: &State, status: &Status<'_>, no_colo
             Constraint::Length((area.width / 3).min(52)),
         ])
         .areas(body);
-        render_tail(frame, tail, state, status, no_color);
-        render_activity(frame, activity, state, status, &summaries, no_color);
+        render_tail(frame, tail, state, status, no_color, mouse);
+        render_activity(frame, activity, state, status, &summaries, no_color, mouse);
     } else if status.service_focus {
-        render_activity(frame, body, state, status, &summaries, no_color);
+        render_activity(frame, body, state, status, &summaries, no_color, mouse);
     } else {
-        render_tail(frame, body, state, status, no_color);
+        render_tail(frame, body, state, status, no_color, mouse);
     }
     expanded.map_or(0, |group| {
+        mouse.add(details, MouseTarget::Details);
         render_details(
             frame,
             details,
@@ -104,6 +121,27 @@ pub fn render_closure_diff(
     scroll: usize,
     no_color: bool,
 ) -> usize {
+    render_closure_diff_interactive(
+        frame,
+        state,
+        status,
+        lines,
+        scroll,
+        no_color,
+        &mut MouseMap::default(),
+    )
+}
+
+pub fn render_closure_diff_interactive(
+    frame: &mut Frame<'_>,
+    state: &State,
+    status: &Status<'_>,
+    lines: &[String],
+    scroll: usize,
+    no_color: bool,
+    mouse: &mut MouseMap,
+) -> usize {
+    mouse.clear();
     let [header, body, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -117,10 +155,21 @@ pub fn render_closure_diff(
         status,
         &state.sidebar_activity(),
         no_color,
+        mouse,
     );
-    frame.render_widget(
-        Line::raw("↑↓ PgUp/PgDn scroll · Esc back · g live · q quit"),
+    mouse.add(body, MouseTarget::Closure);
+    render_keys(
+        frame,
         keys,
+        no_color,
+        mouse,
+        [
+            ("↑↓", "scroll"),
+            ("PgUp/Dn", "page"),
+            ("Esc", "back"),
+            ("g", "live"),
+            ("q", "quit"),
+        ],
     );
     render_scrollable_fields(
         frame,
@@ -131,6 +180,14 @@ pub fn render_closure_diff(
     )
 }
 
+fn visible_line(area: Rect, index: usize) -> Rect {
+    if index < usize::from(area.height) {
+        Rect::new(area.x, area.y + index as u16, area.width, 1)
+    } else {
+        Rect::ZERO
+    }
+}
+
 fn render_header(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -138,6 +195,7 @@ fn render_header(
     status: &Status<'_>,
     activity: &[UnitActivity],
     no_color: bool,
+    mouse: &mut MouseMap,
 ) {
     let (mode, accent) = if state.is_paused() {
         ("Ⅱ Paused", Color::LightYellow)
@@ -161,6 +219,7 @@ fn render_header(
     let title_width = title.width() as u16;
     let [identity, metrics] =
         Layout::horizontal([Constraint::Length(title_width), Constraint::Min(0)]).areas(area);
+    mouse.add(identity, MouseTarget::Live);
     frame.render_widget(title, identity);
     let mut bins = [0; SPARK_BINS];
     let mut severity = [BinSeverity::Normal; SPARK_BINS];
@@ -299,7 +358,9 @@ fn render_tail(
     state: &State,
     status: &Status<'_>,
     no_color: bool,
+    mouse: &mut MouseMap,
 ) {
+    mouse.add(area, MouseTarget::Tail);
     let grouping = match state.grouping() {
         Grouping::Burst => "bursts",
         Grouping::Adjacent => "adjacent",
@@ -348,6 +409,7 @@ fn render_tail(
                 (true, false) => "╰ ",
                 (false, false) => "  ",
             };
+            mouse.add(visible_line(content, lines.len()), MouseTarget::Row(row.id));
             lines.push(tail_line(
                 row,
                 if row.id == selected.id {
@@ -536,11 +598,13 @@ fn render_activity(
     status: &Status<'_>,
     summaries: &[UnitActivity],
     no_color: bool,
+    mouse: &mut MouseMap,
 ) {
     if let Some(spike) = state.spike() {
-        render_spike(frame, area, spike, no_color);
+        render_spike(frame, area, spike, no_color, mouse);
         return;
     }
+    mouse.add(area, MouseTarget::Services);
     let title = if status.service_focus {
         format!("Services · 60s{}", filter_status(state))
     } else {
@@ -597,6 +661,10 @@ fn render_activity(
     };
     let mut lines = Vec::new();
     for (index, entry) in summaries.iter().enumerate().skip(start).take(capacity) {
+        mouse.add(
+            visible_line(list, lines.len()),
+            MouseTarget::Service(entry.unit.clone()),
+        );
         let selected = index == selected_index && status.service_focus;
         let mut spans = vec![Span::raw(if selected { "› " } else { "  " })];
         spans.extend(activity_spans(state, entry, width, peak, no_color));
@@ -613,7 +681,14 @@ fn render_activity(
     frame.render_widget(Paragraph::new(lines), list);
 }
 
-fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_color: bool) {
+fn render_spike(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    spike: &SpikeSnapshot,
+    no_color: bool,
+    mouse: &mut MouseMap,
+) {
+    mouse.add(area, MouseTarget::Spike);
     let block = section("Spike · 60s snapshot".into(), true, no_color);
     let content = block.inner(area);
     frame.render_widget(block, area);
@@ -662,7 +737,22 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
         } else {
             lines.push(Line::styled(truncate_display(name, width), style));
         }
-        let mut chart = spike_chart(bins, spike.selected, peak, style, no_color, paired);
+        let (mut chart, bin_widths) =
+            spike_chart(bins, spike.selected, peak, style, no_color, paired);
+        let chart_row = visible_line(content, lines.len());
+        let mut column = 0;
+        for (index, width) in bin_widths.into_iter().enumerate() {
+            mouse.span(
+                chart_row,
+                column,
+                width,
+                MouseTarget::Bin {
+                    peer: !active,
+                    index,
+                },
+            );
+            column += width;
+        }
         if paired {
             let count = format!("  {} in", bin.count);
             let count = if chart.width() + count.width() <= width {
@@ -718,6 +808,7 @@ fn render_spike(frame: &mut Frame<'_>, area: Rect, spike: &SpikeSnapshot, no_col
             Span::styled(" · prev→now/total", dim),
         ]));
         for (rank, driver) in bin.drivers.iter().enumerate() {
+            mouse.add(visible_line(content, lines.len()), MouseTarget::Rank(rank));
             let previous = driver
                 .previous_count
                 .map_or_else(|| "?".into(), |n| n.to_string());
@@ -746,37 +837,31 @@ fn spike_chart(
     style: Style,
     no_color: bool,
     paired: bool,
-) -> Line<'static> {
+) -> (Line<'static>, [usize; SPARK_BINS]) {
     let cursor = colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD);
     let mut chart = Vec::new();
+    let mut widths = [0; SPARK_BINS];
     for (index, bin) in bins.iter().enumerate() {
+        let start = chart.len();
         let height = spark_height(bin.count, peak);
+        if index == selected {
+            chart.push(Span::styled("[", cursor));
+        }
         if paired && no_color {
-            // Show both severity and volume when comparing bars without color.
-            if index == selected {
-                chart.push(Span::styled("[", cursor));
-            }
             chart.push(spark_bar(" ", bin.severity, style, true));
             chart.push(Span::styled(height, style));
-            if index == selected {
-                chart.push(Span::styled("]", cursor));
-            }
         } else {
-            let marker = if index == selected {
-                "["
-            } else if index == selected + 1 {
-                "]"
-            } else {
-                " "
-            };
-            chart.push(Span::styled(marker, cursor));
+            if index != selected && index != selected + 1 {
+                chart.push(Span::styled(" ", cursor));
+            }
             chart.push(spark_bar(height, bin.severity, style, no_color));
         }
+        if index == selected {
+            chart.push(Span::styled("]", cursor));
+        }
+        widths[index] = chart[start..].iter().map(Span::width).sum();
     }
-    if selected + 1 == SPARK_BINS && !(paired && no_color) {
-        chart.push(Span::styled("]", cursor));
-    }
-    Line::from(chart)
+    (Line::from(chart), widths)
 }
 
 fn activity_spans<'a>(
@@ -924,7 +1009,14 @@ fn render_details(
     render_scrollable_fields(frame, area, block, &fields, scroll)
 }
 
-fn render_context(frame: &mut Frame<'_>, area: Rect, context: &Surroundings, no_color: bool) {
+fn render_context(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    context: &Surroundings,
+    no_color: bool,
+    mouse: &mut MouseMap,
+) {
+    mouse.add(area, MouseTarget::Context);
     let mut title = format!("Context ±2s · {} retained", context.events.len());
     if context.omitted > 0 {
         title.push_str(&format!(" · {} more", context.omitted));
@@ -940,6 +1032,7 @@ fn render_context(frame: &mut Frame<'_>, area: Rect, context: &Surroundings, no_
         .min(context.events.len().saturating_sub(height));
     let mut lines = Vec::new();
     for (i, event) in context.events.iter().enumerate().skip(start).take(height) {
+        mouse.add(visible_line(rows, lines.len()), MouseTarget::ContextRow(i));
         let (label, style) = severity(event.priority, no_color);
         let width = usize::from(rows.width);
         let host = truncate_display(event.host.as_deref().unwrap_or("?"), (width / 6).min(20));
@@ -1083,6 +1176,7 @@ fn render_footer(
     state: &State,
     status: &Status<'_>,
     no_color: bool,
+    mouse: &mut MouseMap,
 ) {
     if let Some(query) = status.search_input {
         let hint = if area.width >= 40 {
@@ -1096,11 +1190,18 @@ fn render_footer(
         let query = format!("/ {query}▏");
         let offset = query.width().saturating_sub(usize::from(input.width)) as u16;
         frame.render_widget(Paragraph::new(query).scroll((0, offset)), input);
+        if !hint.is_empty() {
+            mouse.shortcut(keys, 2, "Enter", "Enter apply".width());
+            mouse.shortcut(
+                keys,
+                "  Enter apply · ".width(),
+                "Esc",
+                "Esc cancel".width(),
+            );
+        }
         frame.render_widget(Line::raw(hint), keys);
         return;
     }
-    let mut spans = Vec::new();
-    let separator = if area.width >= 88 { "  " } else { " " };
     let mut keys = Vec::new();
     if state.context().is_some() {
         keys.extend([
@@ -1172,12 +1273,25 @@ fn render_footer(
             ("Space", if state.is_paused() { "resume" } else { "pause" }),
         ]);
     }
+    render_keys(frame, area, no_color, mouse, keys);
+}
+
+fn render_keys<'a>(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    no_color: bool,
+    mouse: &mut MouseMap,
+    keys: impl IntoIterator<Item = (&'a str, &'a str)>,
+) {
+    let mut spans = Vec::new();
+    let separator = if area.width >= 88 { "  " } else { " " };
     let mut remaining = usize::from(area.width);
     for (key, action) in keys {
         let width = key.width() + 1 + action.width();
         if width > remaining {
             break;
         }
+        mouse.shortcut(area, usize::from(area.width) - remaining, key, width);
         spans.push(Span::styled(
             key,
             colored(Color::LightCyan, no_color).add_modifier(Modifier::BOLD),
@@ -1346,10 +1460,28 @@ mod tests {
         status: &Status<'_>,
         no_color: bool,
     ) -> Buffer {
+        render_mapped(
+            width,
+            height,
+            state,
+            status,
+            no_color,
+            &mut MouseMap::default(),
+        )
+    }
+
+    fn render_mapped(
+        width: u16,
+        height: u16,
+        state: &State,
+        status: &Status<'_>,
+        no_color: bool,
+        map: &mut MouseMap,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, state, status, no_color);
+                render_interactive(frame, state, status, no_color, map);
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -1465,7 +1597,8 @@ mod tests {
         assert!(state.begin_spike());
         for width in [80, 104] {
             for no_color in [true, false] {
-                let buffer = render_buffer(width, 24, &state, &status, no_color);
+                let mut map = MouseMap::default();
+                let buffer = render_mapped(width, 24, &state, &status, no_color, &mut map);
                 let rows = lines(&buffer);
                 let view = rows.join("\n");
                 assert!(
@@ -1501,6 +1634,19 @@ mod tests {
                 let x = rows[a + 1].split_once(bar_a).unwrap().0.width() as u16;
                 assert_eq!(x, rows[b + 1].split_once(bar_b).unwrap().0.width() as u16);
                 assert!(rows[a + 1].contains("8 in") && rows[b + 1].contains("1 in"));
+                for (peer, row, selected_bar) in [(false, a + 1, bar_a), (true, b + 1, bar_b)] {
+                    let target = MouseTarget::Bin {
+                        peer,
+                        index: SPARK_BINS - 1,
+                    };
+                    for col in x..x + selected_bar.width() as u16 {
+                        assert_eq!(map.target(col, row as u16), Some(&target));
+                    }
+                    assert_eq!(
+                        map.target(x + selected_bar.width() as u16, row as u16),
+                        Some(&MouseTarget::Spike)
+                    );
+                }
                 if no_color {
                     assert!(buffer.content().iter().all(|cell| cell.fg == Color::Reset));
                 } else {
@@ -1524,6 +1670,50 @@ mod tests {
                 state.switch_spike_unit();
             }
         }
+    }
+
+    #[test]
+    fn hit_regions_follow_clipped_rows_diagnostics_and_resizes() {
+        use crossterm::event::KeyCode;
+        let mut state = State::default();
+        for i in 0..22 {
+            state.ingest(event(&format!("receipt-{i:02}"), 6, i), i);
+        }
+        let mut map = MouseMap::default();
+        let status = Status {
+            notice: Some("notice"),
+            ..Default::default()
+        };
+        let rows = lines(&render_mapped(104, 12, &state, &status, false, &mut map));
+        let mut found = 0;
+        for (row_index, row) in rows.iter().enumerate() {
+            if let Some(start) = row.find("receipt-") {
+                let message = &row[start..start + "receipt-00".len()];
+                let id = state
+                    .rows()
+                    .iter()
+                    .find(|g| g.first.message == message)
+                    .unwrap()
+                    .id;
+                assert_eq!(
+                    map.target(row[..start].width() as u16, row_index as u16),
+                    Some(&MouseTarget::Row(id))
+                );
+                found += 1;
+            }
+        }
+        assert!(found > 0 && found < state.rows().len());
+        assert_eq!(map.target(1, 1), None); // diagnostic
+        let small = lines(&render_mapped(22, 6, &state, &status, false, &mut map));
+        assert_eq!(map.target(103, 5), None); // discarded wide frame
+        assert_eq!(map.target(0, 2), Some(&MouseTarget::Leader));
+        assert_eq!(
+            map.target(0, 5),
+            Some(&MouseTarget::Shortcut(KeyCode::Char('q')))
+        );
+        assert_eq!(map.target(6, 5), None); // separator after "q quit"
+        assert!(small.last().unwrap().starts_with("q quit Tab services"));
+        assert_eq!(map.target(21, 5), None); // first clipped shortcut
     }
 
     #[test]

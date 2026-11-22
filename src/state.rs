@@ -809,6 +809,20 @@ impl State {
         }
     }
 
+    /// Open the group that was actually painted, even if more entries have arrived.
+    pub fn toggle_row_details(&mut self, id: u64) -> bool {
+        if !self.visible_rows().any(|row| row.id == id) {
+            return false;
+        }
+        if self.paused_row != Some(id) {
+            self.clear_spike_landing();
+        }
+        self.paused = true;
+        self.paused_row = Some(id);
+        self.toggle_expanded();
+        true
+    }
+
     pub fn move_row(&mut self, delta: isize) {
         let row_ids: Vec<_> = self.visible_rows().map(|row| row.id).collect();
         if row_ids.is_empty() {
@@ -830,6 +844,22 @@ impl State {
         }
         if self.paused_row != self.expanded {
             self.expanded = None;
+        }
+    }
+
+    /// Wheel navigation rejoins the live tail when it reaches the newest visible row.
+    pub fn scroll_tail(&mut self, delta: isize) {
+        if delta > 0 && !self.paused {
+            return;
+        }
+        self.move_row(delta);
+        if delta > 0
+            && self
+                .visible_rows()
+                .next_back()
+                .is_some_and(|row| Some(row.id) == self.paused_row)
+        {
+            self.jump_live();
         }
     }
 
@@ -961,11 +991,30 @@ impl State {
             self.spike = None;
             return false;
         };
+        self.capture_spike(&selected.unit);
+        true
+    }
+
+    /// Look up a clicked service by name as its intake ranking can change between draws.
+    pub fn inspect_unit(&mut self, unit: &str) -> bool {
+        if !self
+            .sidebar_activity()
+            .iter()
+            .any(|entry| entry.unit == unit)
+        {
+            return false;
+        }
+        self.selected_unit = Some(unit.to_owned());
+        self.capture_spike(unit);
+        true
+    }
+
+    fn capture_spike(&mut self, unit: &str) {
         let SpikeLane {
             unit,
             bins,
             recovery,
-        } = self.capture_lane(&selected.unit);
+        } = self.capture_lane(unit);
         let peer = if self.pins.len() < MAX_PINS || self.is_pinned(&unit) {
             self.pins
                 .iter()
@@ -998,7 +1047,6 @@ impl State {
             patterns: false,
             following: None,
         });
-        true
     }
 
     pub fn spike(&self) -> Option<&SpikeSnapshot> {
@@ -1297,6 +1345,30 @@ mod tests {
             generation: None,
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn pointer_selection_tracks_ids_across_reranking_and_eviction() {
+        let mut state = State::new(2, 16);
+        state.ingest(event("a", 4, "first", 0), 0);
+        let first = state.rows()[0].id;
+        state.ingest(event("b", 4, "second", 1), 1);
+        let second = state.rows()[1].id;
+        state.ingest(event("b", 4, "third", 2), 2);
+        assert!(!state.toggle_row_details(first));
+        assert!(!state.is_paused());
+        assert!(state.toggle_row_details(second));
+        assert_eq!(state.expanded_group().unwrap().first.message, "second");
+        state.scroll_tail(3);
+        assert!(!state.is_paused());
+        assert!(state.expanded_group().is_none());
+        assert_eq!(state.sidebar_activity()[0].unit, "b");
+        assert!(state.inspect_unit("a"));
+        assert_eq!(state.spike().unwrap().unit, "a");
+        state.cancel_spike();
+        state.advance(WINDOW_MS + 2);
+        assert!(!state.inspect_unit("a"));
+        assert!(state.spike().is_none());
     }
 
     #[test]

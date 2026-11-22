@@ -1,6 +1,6 @@
 mod closure_diff;
-
 mod defaults;
+mod mouse;
 
 use std::{
     io::{self, IsTerminal},
@@ -19,6 +19,7 @@ use crossterm::{
     cursor::{Hide, Show},
     event::{self, Event as TerminalEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
+    style::Print,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use jscope::{
@@ -92,6 +93,10 @@ struct Args {
     /// Disable terminal colors.
     #[arg(long)]
     no_color: bool,
+
+    /// Leave mouse input to the terminal (for example, for native text selection).
+    #[arg(long)]
+    no_mouse: bool,
 }
 
 impl Args {
@@ -124,19 +129,29 @@ impl Args {
     }
 }
 
-struct Screen;
+struct Screen {
+    mouse: bool,
+}
 
 impl Screen {
-    fn enter() -> io::Result<Self> {
+    fn enter(mouse: bool) -> io::Result<Self> {
         terminal::enable_raw_mode()?;
-        let screen = Self;
+        let screen = Self { mouse };
         execute!(io::stdout(), EnterAlternateScreen, Hide)?;
+        if mouse {
+            // Button and wheel reports with SGR coordinates. Crossterm's full
+            // EnableMouseCapture also forwards every pointer movement over SSH.
+            execute!(io::stdout(), Print("\x1b[?1000h\x1b[?1006h"))?;
+        }
         Ok(screen)
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        if self.mouse {
+            let _ = execute!(io::stdout(), Print("\x1b[?1006l\x1b[?1000l"));
+        }
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
     }
@@ -425,7 +440,8 @@ fn run(args: Args) -> io::Result<ExitCode> {
     };
     let mut state = args.initial_state(&defaults)?;
 
-    let _screen = Screen::enter()?;
+    let mouse = !args.no_mouse && mouse::supports_capture(std::env::var("TERM").ok().as_deref());
+    let _screen = Screen::enter(mouse)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let source = match args.input.as_deref() {
         Some(path) => Source::input(path).map_err(|error| {
@@ -448,12 +464,20 @@ fn run(args: Args) -> io::Result<ExitCode> {
     let mut last_draw: Option<Instant> = None;
     let mut dirty = true;
     let mut controls = Controls::default();
+    let mut mouse_map = ui::MouseMap::default();
     let mut input = InputStatus::new(args.input.is_some());
 
     'run: while !stop.load(Ordering::Relaxed) {
         // Sleep on intake so a burst wakes the consumer immediately. Bound the work
         // per turn so keyboard input and screen updates still get time under load.
-        let first = (!input.ended).then(|| source.recv_timeout(POLL_INTERVAL));
+        // After an interaction, repaint before reading another pointer position.
+        // Continue draining intake even when a wheel sends a stream of reports.
+        let intake_wait = if last_draw.is_none() {
+            Duration::ZERO
+        } else {
+            POLL_INTERVAL
+        };
+        let first = (!input.ended).then(|| source.recv_timeout(intake_wait));
         let now = started.elapsed().as_millis() as u64;
         state.advance(now);
         match first {
@@ -493,15 +517,22 @@ fn run(args: Args) -> io::Result<ExitCode> {
             let mut limit = 0;
             terminal.draw(|frame| {
                 limit = match &controls.closure_diff {
-                    Some(diff) => ui::render_closure_diff(
+                    Some(diff) => ui::render_closure_diff_interactive(
                         frame,
                         &state,
                         &status,
                         &diff.lines,
                         diff.scroll,
                         args.no_color,
+                        &mut mouse_map,
                     ),
-                    None => ui::render(frame, &state, &status, args.no_color),
+                    None => ui::render_interactive(
+                        frame,
+                        &state,
+                        &status,
+                        args.no_color,
+                        &mut mouse_map,
+                    ),
                 };
             })?;
             controls.detail_scroll_limit = limit;
@@ -520,13 +551,26 @@ fn run(args: Args) -> io::Result<ExitCode> {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
                 result => result?,
             };
-            dirty = true;
             match event::read() {
-                Ok(TerminalEvent::Key(key)) if !controls.key(key, &mut state) => break 'run,
-                Ok(_) => {}
+                Ok(TerminalEvent::Key(key)) if key.kind != KeyEventKind::Release => {
+                    if !controls.key(key, &mut state) {
+                        break 'run;
+                    }
+                }
+                Ok(TerminalEvent::Mouse(event)) if mouse => {
+                    match controls.mouse(event, &mouse_map, &mut state) {
+                        mouse::Response::Ignored => continue,
+                        mouse::Response::Quit => break 'run,
+                        mouse::Response::Redraw => {}
+                    }
+                }
+                Ok(TerminalEvent::Resize(..)) => {}
+                Ok(_) => continue,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => break,
                 Err(error) => return Err(error),
             }
+            last_draw = None;
+            break;
         }
     }
 
