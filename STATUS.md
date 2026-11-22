@@ -50,9 +50,11 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-39 | Integrator | verified | Flake package and pins | Full flake and two-boot guest passed, including host-configured backlog and command-line overrides |
 | JS-40 | Integrator, screenshot and forge owners | verified | JS-35–39 | Release preparation complete. The 16384.dev deployment is pending |
 | JS-41 | Integrator | verified | JS-40 | Cargo install and replay passed. The README and forge metadata both point to adamloghry/jscope |
+| JS-42 | UI owner, terminal-test owner and integrator | verified | JS-41 | Mouse navigation passed real XTerm, packaged PTY and two-boot VM checks on x86_64-linux |
 
 ### Release checks
 
+- Mouse support on trunk passed the sandboxed flake check and the two-boot NixOS VM on x86_64-linux. PTYs at 80 and 140 columns exercised wheel-to-live, intake while paused, exact-row clicks, receipt and context navigation, keyboard-only fallback and terminal restoration after quit and SIGTERM. In a real XTerm 411, clicks and scrolling navigated from the service ranking through a graph interval to the original journal receipt. Capture is limited to button and wheel events.
 - The sandboxed x86_64-linux flake check passed for the release package, demo wrapper, rustfmt, strict Clippy and 90 Rust tests. These include eight Hegel properties, fifteen deterministic replays and three subprocess lifecycle tests. Packaged PTY checks followed a changing-ID pattern to the original receipt, opened its surrounding services, and exercised the shipped demo.
 - The NixOS module was exercised in a two-boot disposable guest. The probe observed the configured eight-entry backlog, explicit zero and ten-entry overrides, and the actual package change across a switch and rollback. All journal input was guest-generated.
 - The exact `nix run .#demo` README command passed in an 80×24 terminal. The service strip showed `indexer.service [muted]` with 9/2/7. Following its second poll into context reached cursor `demo-02`.

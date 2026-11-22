@@ -114,6 +114,23 @@ ssh HOST journalctl --follow --output=json --no-pager --lines=100 | nix run . --
 
 ## Controls
 
+### With a mouse
+
+Point at the pane you want to scroll. In the journal, each wheel notch moves three visible groups. Scrolling up pauses the tail while intake and service rates keep updating. Scrolling down to the newest visible group or clicking the JournalScope title rejoins live.
+
+| Where | Wheel | Left click |
+| --- | --- | --- |
+| Journal | Browse older or newer groups | Open or close that group’s details |
+| Services | Move one service through the ranking | Inspect that service. On a narrow terminal, click the Noisiest strip to open the list |
+| Spike inspector | Scrub one five-second interval | Select a graph bar on either service, or open a ranked message’s original occurrences |
+| Message occurrences | Scroll long fields. When the text fits, step through occurrences. A horizontal wheel always steps between occurrences | Use the footer shortcuts to jump, open context or go back |
+| Surrounding events | Browse events in journal time | Select a row to see its cursor |
+| Expanded details and NixOS package changes | Scroll the text | Use the title to return to live |
+
+Right-click to go back one view. Footer shortcuts such as **g live** and **Esc back** are clickable. For paired arrows, click the direction you want. Pass `--no-mouse` to keep the terminal’s own mouse behavior, including text selection. Keyboard controls also work with mouse reporting enabled.
+
+### With the keyboard
+
 | Key | Action |
 | --- | --- |
 | Tab | Switch focus between tail and services |
