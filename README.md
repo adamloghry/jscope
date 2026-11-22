@@ -13,7 +13,7 @@ On Linux with Nix flakes enabled, pick a source. JournalScope follows `journalct
 nix run git+https://git.16384.dev/journalscope.git
 
 # From the GitHub mirror
-nix run github:adamloghry/journalscope
+nix run github:adamloghry/jscope
 ```
 
 From a checkout, run `nix run .` for the live journal or **`nix run .#demo`** for a synthetic replay. The demo also runs directly from the published flake.
@@ -21,6 +21,8 @@ From a checkout, run `nix run .` for the live journal or **`nix run .#demo`** fo
 ```sh
 nix run git+https://git.16384.dev/journalscope.git#demo
 ```
+
+With Rust and Cargo on Linux, run `cargo install --locked --path .` from a checkout, then start the dashboard with `jscope`.
 
 ## Try it in a minute
 
@@ -98,4 +100,4 @@ nix build .#vm-test -L    # real journal follow, NixOS switches and shutdown in 
 
 The flake targets `x86_64-linux` and `aarch64-linux`. See the [user guide](docs/guide.md) for grouping rules, keyboard controls and memory limits, and [verification status](STATUS.md) for the architectures actually exercised.
 
-[Project home](https://16384.dev/journalscope) · [GitHub mirror](https://github.com/adamloghry/journalscope) · Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+[Project home](https://16384.dev/journalscope) · [GitHub mirror](https://github.com/adamloghry/jscope) · Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

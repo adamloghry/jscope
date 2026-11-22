@@ -48,7 +48,8 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 | JS-37 | NixOS marker owner | verified | Structured journal format | Integrated flake check passed. Two-boot guest tested switch, rollback and marker navigation |
 | JS-38 | Integrator and VM owner | verified | JS-37 marker fields | Flake and PTY passed. Ordinary guest user saw hello removed on switch and restored on rollback |
 | JS-39 | Integrator | verified | Flake package and pins | Full flake and two-boot guest passed, including host-configured backlog and command-line overrides |
-| JS-40 | Integrator, screenshot and forge owners | verified | JS-35–39 | Release preparation complete. Publish trunk to 16384.dev and its GitHub mirror when ready |
+| JS-40 | Integrator, screenshot and forge owners | verified | JS-35–39 | Release preparation complete. The 16384.dev deployment is pending |
+| JS-41 | Integrator | verified | JS-40 | Cargo install and replay passed. The README and forge metadata both point to adamloghry/jscope |
 
 ### Release checks
 
@@ -57,7 +58,8 @@ The integrator owns this status file and end-to-end verification. Ingestion, sta
 - The exact `nix run .#demo` README command passed in an 80×24 terminal. The service strip showed `indexer.service [muted]` with 9/2/7. Following its second poll into context reached cursor `demo-02`.
 - Three PNGs capture the running Rust binary in XTerm with synthetic input. At 146 arrivals per minute, the muted metrics service leads with 51 incoming, one visible and 50 suppressed. The inspector compares 25 checkout arrivals with eight PostgreSQL arrivals, and the context view locates the original timeout at `demo-0136`.
 - A local build with the 16384 forge rendered the README, checked its relative links and verified all three images byte-for-byte. The static Git export exposed the same trunk commit. The release has a dual MIT OR Apache-2.0 license, with both texts installed in the Nix package.
-- The default and demo apps, packages, dev shells and VM tests evaluated for both targets. Native aarch64-linux execution requires an ARM builder (JS-06). The GitHub workflow is prepared for both architectures. Hosted CI and public deployment await publication.
+- A locked Cargo install from a clean checkout on x86_64-linux with Rust 1.95 produced `jscope 0.1.0`. Its replay showed the muted indexer at 9/2/7 and reached the second poll at cursor `demo-02`.
+- The default and demo apps, packages, dev shells and VM tests evaluated for both targets. Local native aarch64-linux execution requires an ARM builder (JS-06). Hosted results are tracked in [GitHub Actions](https://github.com/adamloghry/jscope/actions).
 
 ## Shared contract
 
