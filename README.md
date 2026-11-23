@@ -1,6 +1,10 @@
 # JournalScope
 
+<p><img src="docs/art/nervous.svg" width="48" height="48" align="middle" alt="😰"> <code>journalctl -f</code> &nbsp;→&nbsp; <img src="docs/art/cool.svg" width="48" height="48" align="middle" alt="😎"> <code>jscope</code></p>
+
 **Which service just got noisy?** `jscope` watches the systemd journal from your terminal. A rolling one-minute graph ranks services by what they send. Pick a spike to see which messages drove it, land on the first error, and read what other services said around that exact instant.
+
+🌐 **[journalscope.akl.run](https://journalscope.akl.run)** · pairs great with [btop](https://github.com/aristocratos/btop)!
 
 ![Journal tail at 146 arrivals per minute. Muted metrics.service leads with 51 incoming entries, one visible warning and 50 suppressed.](docs/screenshots/dashboard.png)
 
@@ -102,4 +106,4 @@ nix build .#vm-test -L    # real journal follow, NixOS switches and shutdown in 
 
 The flake targets `x86_64-linux` and `aarch64-linux`. See the [user guide](docs/guide.md) for grouping rules, keyboard controls and memory limits, and [verification status](STATUS.md) for the architectures actually exercised.
 
-[Project home](https://16384.dev/journalscope) · [GitHub mirror](https://github.com/adamloghry/jscope) · Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+[Website](https://journalscope.akl.run) · [Project home](https://16384.dev/journalscope) · [GitHub mirror](https://github.com/adamloghry/jscope) · Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

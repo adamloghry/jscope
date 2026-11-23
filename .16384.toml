@@ -5,5 +5,9 @@ pitch = "Follow a burst from its service graph to the exact journal entry, the s
 default_branch = "trunk"
 
 [[link]]
+label = "Website"
+url = "https://journalscope.akl.run"
+
+[[link]]
 label = "GitHub mirror"
 url = "https://github.com/adamloghry/jscope"
