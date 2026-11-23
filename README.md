@@ -6,7 +6,7 @@
 
 🌐 **[journalscope.akl.run](https://journalscope.akl.run)** · pairs great with [btop](https://github.com/aristocratos/btop)!
 
-![Journal tail at 146 arrivals per minute. Muted metrics.service leads with 51 incoming entries, one visible warning and 50 suppressed.](docs/screenshots/dashboard.png)
+![An animated walk-through. A synthetic journal fills JournalScope to 146 entries a minute. The checkout API is picked from the Services column, its spike inspector ranks retries and request timeouts, and the context view shows what other services logged around the first timeout.](docs/screenshots/demo.gif)
 
 ## Run it
 
@@ -35,6 +35,8 @@ With Rust and Cargo on Linux, run `cargo install --locked --path .` from a check
 3. Press **c** on a poll to see what the proxy logged within two seconds of it. **Esc** returns to that exact poll. **g** takes you back to live.
 
 ## Inside a checkout timeout
+
+![Journal tail at 146 arrivals per minute. Muted metrics.service leads with 51 incoming entries, one visible warning and 50 suppressed.](docs/screenshots/dashboard.png)
 
 The screenshots use a larger synthetic stream. In the dashboard above, metrics is the loudest service, while the rising arrow points to the checkout API. Pin PostgreSQL and open the API to put their graphs on the same clock. The last interval has 25 API entries and eight database entries. Press **t** to group the timeouts with different request IDs.
 
@@ -101,6 +103,7 @@ The optional marker records boots and live closure changes in the journal, inclu
 ```sh
 nix build                 # ./result/bin/jscope
 nix flake check -L        # formatting, Clippy, Rust/Hegel, replay and terminal tests
+nix run .#screenshots     # re-capture docs/screenshots and the demo GIF (from the repository root)
 nix build .#vm-test -L    # real journal follow, NixOS switches and shutdown in a guest
 ```
 
