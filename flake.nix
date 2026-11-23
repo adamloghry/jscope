@@ -85,6 +85,38 @@
             program = lib.getExe demo;
             meta.description = "Replay a synthetic queue spike in JournalScope";
           };
+          # Re-take the README screenshots and the animated demo from a checkout's repository root.
+          # It runs docs/screenshots/capture.py from the working tree, so edits to it need no rebuild.
+          apps.screenshots = {
+            type = "app";
+            meta.description = "Re-capture docs/screenshots (README stills and demo.gif)";
+            program = lib.getExe (
+              pkgs.writeShellApplication {
+                name = "jscope-screenshots";
+                runtimeInputs = [
+                  pkgs.xvfb-run
+                  pkgs.xterm
+                  pkgs.xdotool
+                  pkgs.imagemagick
+                  pkgs.ffmpeg-full # x11grab, which the default ffmpeg build lacks
+                  pkgs.pngquant
+                  pkgs.oxipng
+                  pkgs.python3
+                ];
+                text = ''
+                  if [ ! -f docs/screenshots/capture.py ]; then
+                    echo "Run this from the root of a JournalScope checkout." >&2
+                    exit 1
+                  fi
+                  FONTCONFIG_FILE=${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}
+                  JSCOPE_CAPTURE_FONT=${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf
+                  export FONTCONFIG_FILE JSCOPE_CAPTURE_FONT
+                  exec xvfb-run -a -s "-screen 0 3200x2000x24 -nolisten tcp" \
+                    python3 docs/screenshots/capture.py ${lib.getExe binary} "$@"
+                '';
+              }
+            );
+          };
           checks = {
             inherit tests;
             terminal = pkgs.runCommand "jscope-terminal"
