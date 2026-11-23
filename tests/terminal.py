@@ -51,8 +51,13 @@ def terminal(command, *, columns, lines, piped=False, env=None, mouse_capture=No
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline and scope.poll() is None:
                     contents = "\n".join(screen.display)
-                    if all(text in contents for text in expected) and not any(
-                        text in contents for text in absent
+                    # One frame can arrive in several reads, so only trust a match once the
+                    # terminal has gone quiet. 20 ms sits between the back-to-back chunks of one
+                    # frame and jscope's 40 ms POLL_INTERVAL between frames (src/main.rs).
+                    if (
+                        all(text in contents for text in expected)
+                        and not any(text in contents for text in absent)
+                        and not select.select([master], [], [], 0.02)[0]
                     ):
                         return contents
                     drain(0.1)
